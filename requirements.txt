@@ -1,0 +1,7 @@
+# Needed only where you have network access -- a Kaggle notebook, a free
+# VM, or CI. Nothing under src/ or tests/ imports this; the modular code
+# and unit tests run without it.
+kaggle-environments>=1.32.7
+
+# Optional, for running tests/ with real pytest instead of a plain script.
+pytest>=7.4
