@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from mechanics import decay_urgency, hire_cost, is_decaying, per_turn_shop_demand
 from state import FarmState, TileState, UnitState, size_keeper_pool
-from strategy import generate_tasks, harvest_urgency
+from strategy import generate_tasks, harvest_urgency, shop_aware_sell_plan
 
 
 def test_hire_cost_is_fibonacci_and_resets_daily() -> None:
@@ -79,3 +79,30 @@ def test_generate_tasks_skips_locked_tiles() -> None:
         hands=[],
     )
     assert generate_tasks(farm) == []
+
+
+def test_shop_aware_sell_plan_sells_any_nonzero_shed_quantity() -> None:
+    # Regression test for a real bug: an earlier version only sold once
+    # the shed was nearly full, which meant it silently never sold
+    # anything for a small farm (a real 720-turn run showed money going
+    # steadily down as a result). A tiny quantity, nowhere near
+    # SHED_CAPACITY (100), must still show up in the sell plan.
+    farm = FarmState(
+        step=10,
+        day=0,
+        hour=10,
+        money=3000,
+        shed={"WHEAT": 2, "CARROT": 0},
+        seeds={},
+        market_prices={},
+        market_inventory={},
+        unlocked_shops=[],
+        unlocked_quadrants=["NW"],
+        hires_today=0,
+        tiles=[],
+        farmer=UnitState(unit_id="farmer", x=4, y=4),
+        hands=[],
+    )
+    plan = shop_aware_sell_plan(farm)
+    assert ("WHEAT", 2) in plan
+    assert all(item != "CARROT" for item, _ in plan)  # zero quantity isn't sellable

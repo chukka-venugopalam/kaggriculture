@@ -58,25 +58,31 @@ python scripts/build_submission.py
 
 ## Verified against a real episode
 
-Ran the exact sample observation through the rewritten agent:
+A full 720-turn run (via a real Kaggle notebook) confirmed the action
+format fix: the farmer walked, bought a seed, and planted, exactly on
+schedule. It also surfaced a real bug -- `shop_aware_sell_plan` only sold
+once the shed was nearly full, so with one or two crop tiles it silently
+never sold anything, and money went steadily down (seed purchases with
+no offsetting sales). Fixed to sell unconditionally, matching AGENTS.md's
+own reference agent, and confirmed directly:
 ```
-{"farmer": ["WEST"], "hands": [], "market": [["BUY_SEED", "WHEAT", 1]]}
+{"farmer": ["WEST"], "hands": [], "market": [["BUY_SEED","WHEAT",1], ["SELL","WHEAT",3]]}
 ```
-Moves toward the nearest empty tile and queues a wheat seed purchase in
-parallel -- a real decision, correctly shaped, not an idle turn.
-`submission/main.py` (the flattened build) produces the byte-identical
-result.
+`submission/main.py` re-verified identical to the modular source after
+the fix.
 
 ## What's still open
 
+- **Whether a full episode now nets positive money** -- the format and
+  sell-threshold bugs are both fixed and unit-tested, but neither of us
+  has run a complete 720-turn episode against the fix yet. That's the
+  next real test.
 - **Ongoing-crop decay** (tomato/strawberry) isn't modeled --
   `max_lifespan_step` is always `-1` for these; the engine tracks their
   decay trigger by cumulative production count instead, which isn't
   derivable from a single observation
 - **Crop selection** for empty tiles is a placeholder (always WHEAT)
-- **Hiring / hands** aren't used yet -- `hands` is always `[]`; the next
-  real piece of work once the single-farmer loop is confirmed working in
-  a real episode
+- **Hiring / hands** aren't used yet -- `hands` is always `[]`
 - **Land buying** (`BUY_LAND`) isn't attempted yet
 
 ## Deliberately left open (tunable -- resolve via real self-play, not a guess)

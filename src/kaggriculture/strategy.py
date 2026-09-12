@@ -22,9 +22,7 @@ from dataclasses import dataclass
 from mechanics import (
     MAX_CONSECUTIVE_UNFED,
     MAX_CONSECUTIVE_UNWATERED,
-    SHED_CAPACITY,
     decay_urgency,
-    per_turn_shop_demand,
 )
 from state import FarmState, TileState
 
@@ -112,18 +110,21 @@ def generate_tasks(farm: FarmState) -> list[Task]:
 
 def shop_aware_sell_plan(farm: FarmState, max_orders: int = 8) -> list[tuple[str, int]]:
     """
-    Sell targeting informed by the real per-shop demand table instead of a
-    shop-count proxy. Prioritizes selling products with the lowest expected
-    town/shop demand relative to shed quantity first.
+    Sell whatever's in the shed. Unsold inventory earns nothing (the
+    confirmed reward rule: "unsold items in inventory do not count"), so
+    there's no reason to hold produce back at this scale.
+
+    This replaces an earlier version that only sold once the shed was
+    nearly full -- a reasonable-sounding "don't let it overflow"
+    heuristic that was actually the reason a real test run showed money
+    going steadily DOWN over 720 turns: with one or two crop tiles, the
+    shed never gets anywhere near full, so that version silently never
+    sold anything while still spending on seeds. Matches the pattern in
+    AGENTS.md's own reference agent instead (sell unconditionally, no
+    threshold). mechanics.py::per_turn_shop_demand is still there for a
+    later pass that times sales around passive town demand -- not used
+    to gate selling for now.
     """
-    demand = per_turn_shop_demand(farm.unlocked_shops)
-    plan: list[tuple[str, int]] = []
-    for item, qty in farm.shed.items():
-        if qty <= 0:
-            continue
-        expected_drain = demand.get(item, 0.0)
-        pressure = qty / SHED_CAPACITY - expected_drain
-        if pressure > 0.3:
-            plan.append((item, qty))
+    plan: list[tuple[str, int]] = [(item, qty) for item, qty in farm.shed.items() if qty > 0]
     plan.sort(key=lambda p: p[1], reverse=True)
     return plan[:max_orders]
