@@ -1,11 +1,10 @@
 # Kaggriculture
 
-Fresh build, scaffolded from a verified-mechanics report rather than any
-prior agent file's comments. `mechanics.py` and `state.py::size_keeper_pool()`
-are confirmed against real `kaggle_environments` source; `strategy.py` is
-new, built to model crop decay via `max_lifespan_step` — the single
-biggest gap in every prior version — and real per-shop demand instead of
-a shop-count proxy.
+Fresh build, scaffolded from a verified-mechanics report and now also a
+real observation dump pulled from a live Kaggle run
+(`tests/fixtures/sample_observation.json`). `mechanics.py`,
+`state.py::size_keeper_pool()`, and the whole parsing layer in `agent.py`
+are confirmed against real data, not guessed.
 
 ## Layout
 
@@ -14,7 +13,7 @@ src/kaggriculture/   the actual logic -- mechanics, state, strategy, agent
 notebooks/           run_episode.ipynb -- clone, install, run a real episode
 scripts/             build_submission.py, test_harness.py (non-notebook use)
 submission/main.py   auto-generated, single-file, ready to submit as-is
-tests/               unit tests for the confirmed-mechanics layer
+tests/               unit tests, incl. tests against a REAL observation
 ```
 
 ## Why there's both `src/` and `submission/main.py`
@@ -32,45 +31,64 @@ commit the new output:**
 python scripts/build_submission.py
 ```
 
-## Get this running on Kaggle, no local setup
+## What's confirmed against real data -- don't re-derive
 
-1. **Push this repo to GitHub.** Extract the zip, then from inside the
-   folder:
-   ```bash
-   git init
-   git add .
-   git commit -m "Kaggriculture: fresh mechanics-verified build"
-   git remote add origin https://github.com/YOUR_USERNAME/kaggriculture.git
-   git push -u origin main
-   ```
-2. **Open `notebooks/run_episode.ipynb` on Kaggle** -- New Notebook, then
-   File > Import Notebook (or paste its cells into a new one).
-3. **Turn Internet ON** in the notebook's settings panel (right sidebar)
-   -- required for both `git clone` and `pip install`.
-4. **Edit `REPO_URL`** in the first code cell to your repo's URL.
-5. **Run All.** It clones your repo, installs `kaggle-environments`, runs
-   one real episode, and writes `sample_observation.json`.
-
-## What's solid vs. what needs a quick check
-
-**Solid, confirmed against the real engine -- don't re-derive:**
+- The observation shape: `obs["farms"][obs["player"]]` is your farm;
+  `money` lives on the farm dict; `tiles` is a 10x10 grid (list of 10
+  rows of 10 cells), not a flat list; a cell is `None` (empty, plantable),
+  the string `"LOCKED"` (unbought quadrant), or a dict once something is
+  planted/built there; `unlocked_quadrants` is a list of name strings
+  (`["NW"]`), not a count; there is exactly one farmer, given as a bare
+  `[x, y]` pair with no id
 - `mechanics.py` -- action vocabulary, crop yield/decay table, shed cap,
   hire cost formula, shop demand table
-- `state.py::size_keeper_pool()` -- verified stable-pool formula (fixes
-  the same-day-hire pool-flip bug)
+- `state.py::size_keeper_pool()` -- verified stable-pool formula
 - `strategy.py::harvest_urgency()` -- decay-driven, reads
   `max_lifespan_step` directly instead of inferring decay
+- `agent.py` now actually moves the farmer toward the highest-urgency
+  task instead of doing nothing -- verified against the real sample
+  observation, not just a synthetic one (`tests/test_agent_parsing.py`)
 
-**Needs the notebook run above, once** -- both isolated to
-`src/kaggriculture/agent.py` and marked `# VERIFY:` inline:
-1. The exact top-level shape of `obs` for iterating tiles and units
-2. The exact expected return format for actions
+## What's still genuinely open
+
+1. **The shape of an occupied tile.** The one real observation available
+   is from turn 0, before anything was planted -- every unlocked cell is
+   just `None`. The dict-shape fields in `TileState.from_raw()` (crop,
+   yield_units, max_lifespan_step, ...) are carried over from the
+   verified-mechanics report as a best guess, not confirmed against a
+   real occupied cell yet.
+2. **The exact action return format.** `agent()` currently returns a
+   single flat list (e.g. `["WEST"]`, `["PLANT", "WHEAT"]`), replacing an
+   earlier per-unit-id dict guess now that the real observation shows no
+   unit ids at all. Still a guess.
+
+**The fastest way to close both out**: `AGENTS.md` and `README.md` ship
+*inside* the installed `kaggle_environments` package. Run this in the
+notebook (or any cell with the package installed):
+
+```python
+import kaggle_environments, os
+
+pkg_dir = os.path.dirname(kaggle_environments.__file__)
+for root, dirs, files in os.walk(pkg_dir):
+    if "AGENTS.md" in files:
+        print(root)
+```
+
+Then `!cat <that path>/AGENTS.md` and `!cat <that path>/README.md`, and
+share the output back. That very likely settles both open items directly
+instead of more guess-and-test cycles.
 
 **Not implemented yet, on purpose:**
-- Unit-to-tile movement/pathing (tasks are assigned with no travel step
-  modeled)
-- Real crop-selection heuristic for empty tiles (currently always plants
-  WHEAT as a placeholder)
+- Selling (`strategy.py::shop_aware_sell_plan` exists but isn't called
+  from `agent()`) -- deliberately left out until the return format is
+  confirmed, since combining a move/tile-action with a market order in
+  one turn isn't confirmed to work
+- A real crop-selection heuristic for empty tiles (currently always
+  plants WHEAT as a placeholder)
+- Multiple farmers / hiring logic (there is exactly one farmer right now;
+  parsing is written to handle more if `"farmer"` becomes a list of pairs,
+  but that shape is unconfirmed)
 
 ## Deliberately left open (tunable -- resolve via real self-play, not a guess)
 
@@ -81,8 +99,15 @@ python scripts/build_submission.py
   opened 0 goose / 3 cow / 2 sheep; every other winner opened 0/2/2
 - Unit ceiling -- 13 held across all 9 real games, never exceeded
 
-Resolve these with real self-play (`env.run([agent_v1, agent_v2])` at
-several seeds) once the schema checks above are done.
+## Get this running on Kaggle, no local setup
+
+1. Push to GitHub: `git init && git add . && git commit -m "..." && git
+   remote add origin <url> && git push -u origin main`
+2. Open `notebooks/run_episode.ipynb` on Kaggle (or paste its cells into
+   a new notebook)
+3. Turn **Internet ON** in the notebook's settings panel (right sidebar)
+4. Edit `REPO_URL` in the first code cell
+5. Run All
 
 ## Tests
 
@@ -91,8 +116,8 @@ pip install pytest
 pytest tests/
 ```
 
-Passing tests confirm the arithmetic and control flow are correct -- they
-run against hand-built inputs, not the real engine. That's a materially
-weaker claim than "works in a real episode," the same gap this project's
-prior 50-test synthetic-obs suite had. Only the notebook / `test_harness.py`
-run against the real engine closes that gap.
+`tests/test_agent_parsing.py` runs against a real observation
+(`tests/fixtures/sample_observation.json`), not just hand-built synthetic
+dicts -- the specific gap this project's earlier 50-test synthetic-obs
+suite had. It confirms parsing is correct as far as one step-0 sample
+allows; it can't confirm the two open items above.

@@ -24,6 +24,9 @@ TOTAL_STEPS: int = TURNS_PER_DAY * TOTAL_DAYS  # 720, confirmed exact
 BOARD_SIZE: int = 10  # four 5x5 quadrants
 STARTING_MONEY: int = 3_000
 QUADRANT_COSTS: tuple[int, ...] = (1_000, 2_000, 4_000)  # cost of the 2nd/3rd/4th quadrant; NW starts unlocked
+# Confirmed via a real observation: unlocked_quadrants is a list of these
+# name strings (e.g. ["NW"]), not a count.
+QUADRANT_NAMES: tuple[str, ...] = ("NW", "NE", "SW", "SE")
 
 # NOT resolved: how many quadrants a strong agent should buy. The prior
 # main.py/new_agent_wip.py comments disagreed with each other (one claims

@@ -29,6 +29,9 @@ TOTAL_STEPS: int = TURNS_PER_DAY * TOTAL_DAYS  # 720, confirmed exact
 BOARD_SIZE: int = 10  # four 5x5 quadrants
 STARTING_MONEY: int = 3_000
 QUADRANT_COSTS: tuple[int, ...] = (1_000, 2_000, 4_000)  # cost of the 2nd/3rd/4th quadrant; NW starts unlocked
+# Confirmed via a real observation: unlocked_quadrants is a list of these
+# name strings (e.g. ["NW"]), not a count.
+QUADRANT_NAMES: tuple[str, ...] = ("NW", "NE", "SW", "SE")
 
 # NOT resolved: how many quadrants a strong agent should buy. The prior
 # main.py/new_agent_wip.py comments disagreed with each other (one claims
@@ -201,37 +204,83 @@ MARKET_STARTING_INVENTORY: int = 10_000  # I0, every product
 """
 state.py — Clean, typed representations of parsed Kaggriculture observations.
 
-Only fields explicitly confirmed (via installed kaggle_environments source,
-its AGENTS.md/README.md, or this project's verified-mechanics report) are
-treated as certain here. The exact top-level container shape for tiles and
-units was NOT independently confirmed in this project's source material —
-that gap lives in agent.py::parse_observation(), isolated from everything
-in this file, which stays correct regardless of how that gets resolved.
+Rewritten against a REAL observation dump (sample_observation.json), not
+guessed. Confirmed by that file:
+  - obs["farms"] is a list of 2 per-player dicts; obs["player"] is the
+    index of "your" farm
+  - each farm's "money" lives on the farm dict itself, NOT under "private"
+  - each farm's "tiles" is a 10x10 grid (list of 10 rows, each a list of
+    10 cells) -- not a flat list. A cell is `None` (empty, unlocked,
+    plantable), the string "LOCKED" (unbought quadrant), or -- unconfirmed,
+    no example existed yet in the sample -- presumably a dict once
+    something is planted/built/growing there
+  - "unlocked_quadrants" is a list of quadrant-name strings (e.g. ["NW"]),
+    not a count
+  - each farm currently has exactly ONE farmer, given as a plain [x, y]
+    position pair under "farmer" -- not a list of unit dicts with ids.
+    Whether this becomes a list of pairs after a HIRE is not yet observed;
+    parsing below handles both shapes defensively.
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
 class TileState:
     x: int
     y: int
+    locked: bool = False
     crop: str | None = None
     yield_units: int = 0
-    max_lifespan_step: int | None = None  # confirmed field; drives decay
+    max_lifespan_step: int | None = None
     consecutive_unwatered: int = 0
     fertilized: bool = False
-    structure: str | None = None  # "COOP" | "PASTURE" | None
+    structure: str | None = None
     animal: str | None = None
     consecutive_unfed: int = 0
     is_weed: bool = False
-    quadrant: int = 0  # which of the 4 quadrants this tile is in
-    locked: bool = False  # unbought quadrant — passable, actions no-op here
+
+    @classmethod
+    def from_raw(cls, x: int, y: int, raw_cell: Any) -> "TileState":
+        """
+        Confirmed for `None` (empty) and "LOCKED". The dict branch below is
+        NOT yet confirmed against a real occupied tile -- no example
+        existed in the one sample observation available (step 0, nothing
+        planted yet). Field names there are carried over from the
+        verified-mechanics report's crop/decay vocabulary as a best guess;
+        get a later-turn observation (after a real PLANT/BUILD) to confirm
+        or correct them.
+        """
+        if raw_cell is None:
+            return cls(x=x, y=y)
+        if raw_cell == "LOCKED":
+            return cls(x=x, y=y, locked=True)
+        if isinstance(raw_cell, dict):
+            return cls(
+                x=x,
+                y=y,
+                crop=raw_cell.get("crop"),
+                yield_units=raw_cell.get("yield_units", 0),
+                max_lifespan_step=raw_cell.get("max_lifespan_step"),
+                consecutive_unwatered=raw_cell.get("consecutive_unwatered", 0),
+                fertilized=raw_cell.get("fertilized", False),
+                structure=raw_cell.get("structure"),
+                animal=raw_cell.get("animal"),
+                consecutive_unfed=raw_cell.get("consecutive_unfed", 0),
+                is_weed=raw_cell.get("type") == "WEED" or raw_cell.get("is_weed", False),
+            )
+        # Unrecognized shape -- treat as an empty tile rather than crash or
+        # silently drop it, and let the caller's own logging surface it.
+        return cls(x=x, y=y)
 
 
 @dataclass
 class UnitState:
-    unit_id: str
+    unit_id: str  # synthesized locally ("farmer_0", ...) -- the real obs
+    # has no id field at all, just bare [x, y] positions. Don't send this
+    # id anywhere in the returned action; it's for this code's own
+    # bookkeeping only.
     x: int
     y: int
     carrying: dict[str, int] = field(default_factory=dict)
@@ -241,13 +290,14 @@ class UnitState:
 class FarmState:
     step: int
     day: int
-    money: int
-    shed: dict[str, int]  # obs["private"]["shed"] — confirmed correct
-    seeds: dict[str, int]  # separate, uncapped slot
-    market_prices: dict[str, float]  # obs["market"]["prices"] — confirmed correct
-    market_inventory: dict[str, int]  # obs["market"]["inventory"] — confirmed correct
-    unlocked_shops: list[str]  # obs["town"]["unlocked_shops"] — list, duplicates possible
-    unlocked_quadrants: int
+    hour: int
+    money: float
+    shed: dict[str, int]
+    seeds: dict[str, int]
+    market_prices: dict[str, float]
+    market_inventory: dict[str, int]
+    unlocked_shops: list[str]
+    unlocked_quadrants: list[str]  # e.g. ["NW"] -- names, not a count
     hires_today: int
     tiles: list[TileState]
     units: list[UnitState]
@@ -257,12 +307,9 @@ def size_keeper_pool(n_units: int, n_animals_active: int) -> int:
     """
     Independently verified stable-pool-sizing formula. Sizing off herd size
     rather than raw unit count keeps pool membership stable across a
-    same-day hire: a new hire changes n_units immediately, but
-    n_animals_active only changes when an animal is actually bought and
-    placed — so the keeper set doesn't reshuffle just because headcount
-    went up. Confirmed to fix a pool-flip bug where a unit got yanked off
-    wheat-watering to cow-feeding purely because a hire happened, same
-    task backlog, only headcount changed.
+    same-day hire. With only one starting farmer this always resolves to
+    1 either way, but it's kept as-is (rather than special-cased) so it
+    keeps working once hiring is implemented and n_units actually grows.
     """
     return max(1, min(3, n_units - 2, 1 + n_animals_active // 3))
 
@@ -400,22 +447,27 @@ def shop_aware_sell_plan(farm: FarmState, max_orders: int = 8) -> list[tuple[str
 """
 agent.py — Kaggriculture submission entrypoint.
 
-CONFIRMED (verified against installed kaggle_environments==1.32.7 and its
-AGENTS.md/README.md, per this project's verified-mechanics report): every
-field name used in parse_observation() below under obs["private"],
-obs["market"], and obs["town"], plus max_lifespan_step and the
-consecutive_unwatered/consecutive_unfed tile fields.
+Rewritten against a REAL observation dump (sample_observation.json).
+CONFIRMED by that file: obs["farms"][obs["player"]] is your farm; money
+lives on the farm dict; tiles is a 10x10 grid, not a flat list; a cell is
+`None` (empty), the string "LOCKED", or (unconfirmed -- no example yet)
+presumably a dict; there is exactly one farmer right now, given as a bare
+[x, y] pair with no id; unlocked_quadrants is a list of name strings.
 
-NOT YET CONFIRMED — flagged inline with `# VERIFY:` — exactly two things:
-  1. The top-level container shape for iterating tiles and units.
-  2. The expected return format for actions.
-Both are isolated to this file. state.py, strategy.py, and mechanics.py
-don't need to change once you confirm them — run test_harness.py, inspect
-the dumped sample_observation.json, and fix the two spots below.
+STILL NOT CONFIRMED, flagged inline with `# VERIFY:`:
+  1. The shape of an occupied tile (planted/growing/built) -- no example
+     existed in a step-0 observation. Get one after a real PLANT/BUILD.
+  2. The exact expected return format for actions. A single flat list
+     (e.g. ["PLANT", "WHEAT"]) is this pass's best guess, replacing the
+     earlier per-unit-id dict guess now that the observation shows no
+     unit ids at all -- but this is still a guess.
 
-Also not yet implemented: unit-to-tile movement/pathing. Tasks are
-assigned to units directly with no travel step modeled — the next real
-piece of work once the schema is confirmed, not guessed at here.
+The single fastest way to close out both of these: `AGENTS.md` and
+`README.md` ship inside the installed kaggle_environments package itself.
+Reading them directly (you have network access; this sandbox doesn't)
+would very likely settle both in one pass instead of more guess-and-test
+cycles. See the chat response for the exact commands to find and print
+them.
 """
 
 import logging
@@ -423,101 +475,116 @@ from typing import Any
 
 
 logger = logging.getLogger("kaggriculture_agent")
-logging.basicConfig(level=logging.WARNING)  # flip to INFO/DEBUG for local runs; keep quiet in competition
+logging.basicConfig(level=logging.WARNING)
 
 
 def parse_observation(obs: dict[str, Any], config: dict[str, Any]) -> FarmState:
+    player_idx = obs["player"]
+    my_farm = obs["farms"][player_idx]
     private = obs["private"]
     market = obs["market"]
     town = obs["town"]
 
-    # VERIFY: adjust these two lines to the real top-level obs shape once
-    # you've inspected sample_observation.json from test_harness.py.
-    raw_tiles = obs.get("tiles", [])
-    raw_units = obs.get("units", [])
-
-    tiles = [
-        TileState(
-            x=t["x"],
-            y=t["y"],
-            crop=t.get("crop"),
-            yield_units=t.get("yield_units", 0),
-            max_lifespan_step=t.get("max_lifespan_step"),
-            consecutive_unwatered=t.get("consecutive_unwatered", 0),
-            fertilized=t.get("fertilized", False),
-            structure=t.get("structure"),
-            animal=t.get("animal"),
-            consecutive_unfed=t.get("consecutive_unfed", 0),
-            is_weed=t.get("is_weed", False),
-            quadrant=t.get("quadrant", 0),
-            locked=t.get("locked", False),
-        )
-        for t in raw_tiles
+    tiles: list[TileState] = [
+        TileState.from_raw(x, y, cell)
+        for y, row in enumerate(my_farm["tiles"])
+        for x, cell in enumerate(row)
     ]
-    units = [
-        UnitState(unit_id=u["id"], x=u["x"], y=u["y"], carrying=u.get("carrying", {}))
-        for u in raw_units
+
+    # VERIFY: whether "farmer" becomes a list of [x, y] pairs after a HIRE,
+    # or something else entirely. Handled defensively either way -- a bare
+    # [x, y] pair (current reality) is treated as one farmer; a list of
+    # pairs would be treated as several.
+    raw_farmer = my_farm.get("farmer", [])
+    positions: list[tuple[int, int]]
+    if raw_farmer and isinstance(raw_farmer[0], (int, float)):
+        positions = [(int(raw_farmer[0]), int(raw_farmer[1]))]
+    else:
+        positions = [(int(p[0]), int(p[1])) for p in raw_farmer]
+
+    # Best guess: private["inventories"] is a per-farmer carried-items list
+    # -- its length (1) matched the farmer count (1) exactly in the sample.
+    # Not yet confirmed against a turn where a farmer is actually carrying
+    # something.
+    raw_inventories = private.get("inventories", [])
+    units: list[UnitState] = [
+        UnitState(
+            unit_id=f"farmer_{i}",
+            x=x,
+            y=y,
+            carrying=raw_inventories[i] if i < len(raw_inventories) else {},
+        )
+        for i, (x, y) in enumerate(positions)
     ]
 
     return FarmState(
         step=obs.get("step", 0),
-        day=obs.get("day", obs.get("step", 0) // 24),  # VERIFY: obs may expose "day" directly
-        money=private.get("money", 0),
+        day=obs.get("day", 0),
+        hour=obs.get("hour", 0),
+        money=my_farm.get("money", 0.0),
         shed=private.get("shed", {}),
         seeds=private.get("seeds", {}),
         market_prices=market.get("prices", {}),
         market_inventory=market.get("inventory", {}),
         unlocked_shops=town.get("unlocked_shops", []),
-        unlocked_quadrants=private.get("unlocked_quadrants", 1),
-        hires_today=private.get("hires_today", 0),
+        unlocked_quadrants=my_farm.get("unlocked_quadrants", []),
+        hires_today=my_farm.get("hires_today", 0),
         tiles=tiles,
         units=units,
     )
 
 
-def agent(obs: dict[str, Any], config: dict[str, Any]) -> dict[str, list[Any]]:
+def _direction_toward(from_x: int, from_y: int, to_x: int, to_y: int) -> str | None:
     """
-    VERIFY: the return shape. Assumed here — a dict mapping unit_id to an
-    action list, e.g. {"unit_3": ["PICKUP", "WHEAT", 5]} — is the common
-    convention for multi-unit Kaggle simulation competitions, but this
-    project's source material never pinned down the exact expected format.
-    Confirm against AGENTS.md/README.md or a real successful env.run()
-    before trusting this in a real submission.
+    VERIFY: assumes index 0 of a position pair is x (column, increases
+    EAST) and index 1 is y (row, increases SOUTH) -- a common convention,
+    not yet confirmed. Locked tiles are confirmed passable, so no obstacle
+    avoidance is needed -- straight-line greedy stepping is enough.
+    """
+    dx = to_x - from_x
+    dy = to_y - from_y
+    if dx == 0 and dy == 0:
+        return None  # already there
+    if abs(dx) >= abs(dy):
+        return "EAST" if dx > 0 else "WEST"
+    return "SOUTH" if dy > 0 else "NORTH"
+
+
+def agent(obs: dict[str, Any], config: dict[str, Any]) -> list[Any]:
+    """
+    VERIFY: the return shape -- see module docstring. A single flat
+    action list, matching the single farmer this game currently has.
+    Selling (mechanics/strategy already support it via
+    strategy.shop_aware_sell_plan) is deliberately left out of this pass:
+    with only one action slot available per turn and no confirmed way to
+    combine a move/tile-action with a market order in the same return
+    value, guessing at that combination risks breaking both. Add it back
+    once the return format is confirmed.
     """
     try:
         farm = parse_observation(obs, config)
     except Exception:
-        logger.exception("parse_observation failed; returning no actions as a safe fallback")
-        return {}
+        logger.exception("parse_observation failed; passing this turn as a safe fallback")
+        return ["PASS"]
 
-    n_animals_active = sum(1 for t in farm.tiles if t.animal is not None)
-    n_keepers = size_keeper_pool(len(farm.units), n_animals_active)
-    keepers = farm.units[:n_keepers]  # first-k, stable across same-day hires
-    crop_crew = farm.units[n_keepers:]
+    if not farm.units:
+        return ["PASS"]
 
     tasks = generate_tasks(farm)
-    sell_plan = shop_aware_sell_plan(farm)
+    if not tasks:
+        return ["PASS"]
 
-    # First-pass allocator, not a solved scheduler: no movement/pathing
-    # between a unit and its assigned tile is modeled yet.
-    animal_tasks = [t for t in tasks if t.kind in ("FEED", "CARE", "PLACE", "BUILD")]
-    crop_tasks = [t for t in tasks if t.kind in ("HARVEST", "WATER", "FERTILIZE", "PLANT", "DIG", "COLLECT_FERTILIZER")]
+    unit = farm.units[0]  # exactly one farmer for now
+    task = tasks[0]  # highest urgency
 
-    actions: dict[str, list[Any]] = {}
-    for unit, task in zip(keepers, animal_tasks + crop_tasks):
-        actions[unit.unit_id] = [task.kind]
-    for unit, task in zip(crop_crew, crop_tasks + animal_tasks):
-        actions.setdefault(unit.unit_id, [task.kind])
+    direction = _direction_toward(unit.x, unit.y, task.tile.x, task.tile.y)
+    if direction is not None:
+        return [direction]
 
-    if sell_plan:
-        # VERIFY: who/what submits a market order. ["SELL", item, n] is the
-        # confirmed action shape; attaching it under "_market" here is a
-        # placeholder, not a confirmed submission convention.
-        market_orders: list[Any] = []
-        for item, qty in sell_plan[: len(sell_plan)]:
-            market_orders.extend(["SELL", item, qty])
-        if market_orders:
-            actions["_market"] = market_orders
-
-    return actions
+    # Already on the target tile -- perform its action.
+    if task.kind == "PLANT":
+        # VERIFY: PLANT's real argument shape; WHEAT is a placeholder
+        # crop choice, not a real selection heuristic.
+        return ["PLANT", "WHEAT"]
+    return [task.kind]
 
