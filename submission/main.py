@@ -86,38 +86,43 @@ MAX_MARKET_ORDERS_PER_TURN: int = 10  # extras silently dropped
 
 @dataclass(frozen=True)
 class CropProfile:
+    seed_cost: int
+    base_price: int
     first_yield_day: int
-    max_yield_day: int | None  # None for "ongoing" crops (tomato/strawberry)
+    max_yield_day: int  # confirmed exact for all 5 crops, incl. ongoing ones
     max_yield: int  # fertilized max, per confirmed table
     max_yield_unfertilized: int | None = None
     ongoing_interval_days: int | None = None  # tomato=1, strawberry=2
     ongoing_productions: int | None = None  # both ongoing crops: 4
 
 
+# Confirmed against README.md's Object Types table exactly.
 CROPS: dict[str, CropProfile] = {
-    "WHEAT": CropProfile(first_yield_day=2, max_yield_day=4, max_yield=6, max_yield_unfertilized=4),
-    "CARROT": CropProfile(first_yield_day=2, max_yield_day=3, max_yield=4, max_yield_unfertilized=3),
-    "MELON": CropProfile(first_yield_day=10, max_yield_day=12, max_yield=6),
-    "TOMATO": CropProfile(first_yield_day=8, max_yield_day=None, max_yield=4, ongoing_interval_days=1, ongoing_productions=4),
-    "STRAWBERRY": CropProfile(first_yield_day=10, max_yield_day=None, max_yield=4, ongoing_interval_days=2, ongoing_productions=4),
+    "WHEAT": CropProfile(seed_cost=10, base_price=25, first_yield_day=2, max_yield_day=4, max_yield=6, max_yield_unfertilized=4),
+    "CARROT": CropProfile(seed_cost=20, base_price=35, first_yield_day=2, max_yield_day=3, max_yield=4, max_yield_unfertilized=3),
+    "MELON": CropProfile(seed_cost=80, base_price=250, first_yield_day=10, max_yield_day=10, max_yield=6),
+    "TOMATO": CropProfile(seed_cost=50, base_price=60, first_yield_day=8, max_yield_day=11, max_yield=4, ongoing_interval_days=1, ongoing_productions=4),
+    "STRAWBERRY": CropProfile(seed_cost=100, base_price=120, first_yield_day=10, max_yield_day=16, max_yield=4, ongoing_interval_days=2, ongoing_productions=4),
 }
 
 
-def is_decaying(max_lifespan_step: int | None, current_step: int) -> bool:
-    """True once a tile has passed max_lifespan_step. Reads the field
-    directly rather than inferring decay from yield_units or age — exactly
-    the mistake every prior agent version made."""
-    if max_lifespan_step is None:
+def is_decaying(max_lifespan_step: int, current_step: int) -> bool:
+    """True once a tile has passed max_lifespan_step. -1 means "not
+    applicable" (an ongoing crop, whose decay trigger isn't step-based) —
+    treated as never-decaying here since that path isn't modeled yet."""
+    if max_lifespan_step is None or max_lifespan_step < 0:
         return False
     return current_step > max_lifespan_step
 
 
-def decay_urgency(max_lifespan_step: int | None, current_step: int) -> float:
+def decay_urgency(max_lifespan_step: int, current_step: int) -> float:
     """Higher = more urgent to harvest NOW. Once decaying, yield_units drops
     by 1 every other turn until the tile becomes a weed — so every 2 turns
     of delay past max_lifespan_step is a full unit of yield, permanently
-    lost."""
-    if max_lifespan_step is None:
+    lost. Ongoing crops (max_lifespan_step == -1) aren't modeled here yet —
+    their decay trigger is a cumulative-production count, not a step
+    number, and isn't derivable from a single observation."""
+    if max_lifespan_step is None or max_lifespan_step < 0:
         return 0.0
     turns_past_decay = current_step - max_lifespan_step
     if turns_past_decay <= 0:
@@ -204,22 +209,10 @@ MARKET_STARTING_INVENTORY: int = 10_000  # I0, every product
 """
 state.py — Clean, typed representations of parsed Kaggriculture observations.
 
-Rewritten against a REAL observation dump (sample_observation.json), not
-guessed. Confirmed by that file:
-  - obs["farms"] is a list of 2 per-player dicts; obs["player"] is the
-    index of "your" farm
-  - each farm's "money" lives on the farm dict itself, NOT under "private"
-  - each farm's "tiles" is a 10x10 grid (list of 10 rows, each a list of
-    10 cells) -- not a flat list. A cell is `None` (empty, unlocked,
-    plantable), the string "LOCKED" (unbought quadrant), or -- unconfirmed,
-    no example existed yet in the sample -- presumably a dict once
-    something is planted/built/growing there
-  - "unlocked_quadrants" is a list of quadrant-name strings (e.g. ["NW"]),
-    not a count
-  - each farm currently has exactly ONE farmer, given as a plain [x, y]
-    position pair under "farmer" -- not a list of unit dicts with ids.
-    Whether this becomes a list of pairs after a HIRE is not yet observed;
-    parsing below handles both shapes defensively.
+Rewritten against the official AGENTS.md / README.md shipped inside the
+installed kaggle_environments package — not guessed, not reconstructed
+from an agent file's comments. Every field name and shape here is a
+direct match to the documented Observation Format.
 """
 
 from dataclasses import dataclass, field
@@ -231,56 +224,73 @@ class TileState:
     x: int
     y: int
     locked: bool = False
+    kind: str | None = None  # "PLANT" | "WEED" | "COOP" | "PASTURE" | None (empty, unlocked)
+
+    # PLANT fields
     crop: str | None = None
-    yield_units: int = 0
-    max_lifespan_step: int | None = None
+    planted_day: int | None = None
+    watered_today: bool = False
     consecutive_unwatered: int = 0
-    fertilized: bool = False
-    structure: str | None = None
+    yield_units: int = 0
+    max_lifespan_step: int = -1  # -1 = not applicable (ongoing crop, or non-plant tile)
+    fertilized_until_day: int = -1  # -1 = no active fertilizer bonus
+
+    # COOP / PASTURE fields
     animal: str | None = None
+    placed_day: int | None = None
+    fed_today: bool = False
     consecutive_unfed: int = 0
-    is_weed: bool = False
+    cared_today: bool = False
+    fertilizer_available: bool = False
+    pending_care_bonus: int = 0
+
+    def is_fertilized(self, current_day: int) -> bool:
+        return self.fertilized_until_day >= current_day
 
     @classmethod
     def from_raw(cls, x: int, y: int, raw_cell: Any) -> "TileState":
-        """
-        Confirmed for `None` (empty) and "LOCKED". The dict branch below is
-        NOT yet confirmed against a real occupied tile -- no example
-        existed in the one sample observation available (step 0, nothing
-        planted yet). Field names there are carried over from the
-        verified-mechanics report's crop/decay vocabulary as a best guess;
-        get a later-turn observation (after a real PLANT/BUILD) to confirm
-        or correct them.
-        """
         if raw_cell is None:
             return cls(x=x, y=y)
         if raw_cell == "LOCKED":
             return cls(x=x, y=y, locked=True)
-        if isinstance(raw_cell, dict):
+        if not isinstance(raw_cell, dict):
+            # Unrecognized shape -- treat as empty rather than crash.
+            return cls(x=x, y=y)
+
+        kind = raw_cell.get("kind")
+        if kind == "PLANT":
             return cls(
-                x=x,
-                y=y,
+                x=x, y=y, kind="PLANT",
                 crop=raw_cell.get("crop"),
-                yield_units=raw_cell.get("yield_units", 0),
-                max_lifespan_step=raw_cell.get("max_lifespan_step"),
+                planted_day=raw_cell.get("planted_day"),
+                watered_today=raw_cell.get("watered_today", False),
                 consecutive_unwatered=raw_cell.get("consecutive_unwatered", 0),
-                fertilized=raw_cell.get("fertilized", False),
-                structure=raw_cell.get("structure"),
-                animal=raw_cell.get("animal"),
-                consecutive_unfed=raw_cell.get("consecutive_unfed", 0),
-                is_weed=raw_cell.get("type") == "WEED" or raw_cell.get("is_weed", False),
+                yield_units=raw_cell.get("yield_units", 0),
+                max_lifespan_step=raw_cell.get("max_lifespan_step", -1),
+                fertilized_until_day=raw_cell.get("fertilized_until_day", -1),
             )
-        # Unrecognized shape -- treat as an empty tile rather than crash or
-        # silently drop it, and let the caller's own logging surface it.
-        return cls(x=x, y=y)
+        if kind == "WEED":
+            return cls(x=x, y=y, kind="WEED")
+        if kind in ("COOP", "PASTURE"):
+            return cls(
+                x=x, y=y, kind=kind,
+                animal=raw_cell.get("animal"),
+                placed_day=raw_cell.get("placed_day"),
+                yield_units=raw_cell.get("yield_units", 0),
+                fed_today=raw_cell.get("fed_today", False),
+                consecutive_unfed=raw_cell.get("consecutive_unfed", 0),
+                cared_today=raw_cell.get("cared_today", False),
+                fertilizer_available=raw_cell.get("fertilizer_available", False),
+                pending_care_bonus=raw_cell.get("pending_care_bonus", 0),
+            )
+        return cls(x=x, y=y)  # unrecognized "kind" -- treat as empty
 
 
 @dataclass
 class UnitState:
-    unit_id: str  # synthesized locally ("farmer_0", ...) -- the real obs
-    # has no id field at all, just bare [x, y] positions. Don't send this
-    # id anywhere in the returned action; it's for this code's own
-    # bookkeeping only.
+    unit_id: str  # "farmer" or "hand_0", "hand_1", ... -- local bookkeeping
+    # only; never sent back in the action (the real action addresses the
+    # farmer and hands by their fixed "farmer"/"hands" keys, not by id).
     x: int
     y: int
     carrying: dict[str, int] = field(default_factory=dict)
@@ -300,16 +310,16 @@ class FarmState:
     unlocked_quadrants: list[str]  # e.g. ["NW"] -- names, not a count
     hires_today: int
     tiles: list[TileState]
-    units: list[UnitState]
+    farmer: UnitState
+    hands: list[UnitState]
 
 
 def size_keeper_pool(n_units: int, n_animals_active: int) -> int:
     """
     Independently verified stable-pool-sizing formula. Sizing off herd size
     rather than raw unit count keeps pool membership stable across a
-    same-day hire. With only one starting farmer this always resolves to
-    1 either way, but it's kept as-is (rather than special-cased) so it
-    keeps working once hiring is implemented and n_units actually grows.
+    same-day hire. Kept ready for when hiring is implemented and n_units
+    actually grows past 1.
     """
     return max(1, min(3, n_units - 2, 1 + n_animals_active // 3))
 
@@ -317,17 +327,19 @@ def size_keeper_pool(n_units: int, n_animals_active: int) -> int:
 """
 strategy.py — Task generation and prioritization.
 
-The one thing every prior agent version got wrong or left unfinished:
-HARVEST priority needs to be driven directly by max_lifespan_step (decay),
-not a fixed tier number reasoned about in the abstract. This module
-computes a continuous urgency score per task instead of a fixed tier, so
-decay pressure and routine upkeep can be weighed against each other rather
-than lexicographically ordered.
+Rewritten against the official tile schema (kind-discriminated: "PLANT",
+"WEED", "COOP", "PASTURE", or empty). HARVEST priority is driven directly
+by max_lifespan_step (decay) for one-time crops -- the single biggest gap
+in every prior version of this project.
 
-Known gap, intentionally not solved here: crop selection for empty,
-plantable tiles is a placeholder (always WHEAT — see generate_tasks). A
-real heuristic (season timing, market price, quadrant mix) is the next
-piece of strategy to build, not included in this pass.
+Known gaps, intentionally not solved here:
+- Ongoing-crop (tomato/strawberry) decay isn't modeled: their
+  max_lifespan_step is always -1 (the engine tracks their decay trigger
+  by cumulative production count, not a step number), and that count
+  isn't derivable from a single observation.
+- Crop selection for empty tiles is a placeholder (always WHEAT).
+- Only the main farmer is assigned a task; hands (once hiring is
+  implemented) aren't scheduled yet.
 """
 
 from dataclasses import dataclass
@@ -341,20 +353,16 @@ class Task:
     urgency: float  # higher = more urgent; used to sort, not a fixed tier
 
 
-# Base urgency per task kind, before decay/backlog adjustments. Tunable —
-# starting points informed by this project's process history (CARE and
-# weed-DIG were previously under-prioritized and had to be bumped after
-# observed failures), not re-derived from scratch here.
 BASE_URGENCY: dict[str, float] = {
-    "FEED_CRITICAL": 100.0,  # one more miss loses the animal
-    "WATER_CRITICAL": 95.0,  # one more miss turns the tile into a weed
-    "HARVEST_DECAYING": 90.0,  # scales up further the longer it's ignored
+    "FEED_CRITICAL": 100.0,
+    "WATER_CRITICAL": 95.0,
+    "HARVEST_DECAYING": 90.0,
     "PLACE": 80.0,
     "FEED_ROUTINE": 60.0,
     "WATER_ROUTINE": 55.0,
-    "HARVEST_FRESH": 50.0,  # ripe but not yet decaying — still worth prioritizing over routine upkeep
+    "HARVEST_FRESH": 50.0,
     "CARE": 45.0,
-    "DIG": 40.0,  # weed removal — DIG is confirmed real; ["PICKUP","WEED"] is not
+    "DIG": 40.0,
     "BUILD": 35.0,
     "PLANT": 30.0,
     "FERTILIZE": 20.0,
@@ -363,12 +371,8 @@ BASE_URGENCY: dict[str, float] = {
 
 
 def harvest_urgency(tile: TileState, current_step: int) -> float:
-    """
-    Decay-aware HARVEST urgency. Every prior fix (tier 1 -> 5 -> 4) reasoned
-    about this qualitatively ("land isn't earning"); this computes it
-    directly from the confirmed mechanic: once max_lifespan_step passes,
-    yield_units drops by 1 every other turn until the tile becomes a weed.
-    """
+    """Decay-aware HARVEST urgency for a PLANT tile. Reads
+    max_lifespan_step directly rather than inferring decay."""
     urgency = decay_urgency(tile.max_lifespan_step, current_step)
     if urgency > 0:
         return BASE_URGENCY["HARVEST_DECAYING"] + min(urgency, 10.0) * max(tile.yield_units, 1)
@@ -384,40 +388,40 @@ def generate_tasks(farm: FarmState) -> list[Task]:
         if tile.locked:
             continue  # every tile action no-ops on an unbought quadrant
 
-        if tile.is_weed:
+        if tile.kind == "WEED":
             tasks.append(Task("DIG", tile, BASE_URGENCY["DIG"]))
             continue
 
-        if tile.yield_units > 0 or tile.max_lifespan_step is not None:
+        if tile.kind == "PLANT":
             u = harvest_urgency(tile, farm.step)
             if u > 0:
                 tasks.append(Task("HARVEST", tile, u))
-
-        if tile.crop is not None:
-            grace_left = MAX_CONSECUTIVE_UNWATERED - tile.consecutive_unwatered
-            key = "WATER_CRITICAL" if grace_left <= 1 else "WATER_ROUTINE"
-            tasks.append(Task("WATER", tile, BASE_URGENCY[key]))
-            if not tile.fertilized:
+            if not tile.watered_today:
+                grace_left = MAX_CONSECUTIVE_UNWATERED - tile.consecutive_unwatered
+                key = "WATER_CRITICAL" if grace_left <= 1 else "WATER_ROUTINE"
+                tasks.append(Task("WATER", tile, BASE_URGENCY[key]))
+            if not tile.is_fertilized(farm.day):
                 tasks.append(Task("FERTILIZE", tile, BASE_URGENCY["FERTILIZE"]))
+            continue
 
-        if tile.animal is not None:
-            grace_left = MAX_CONSECUTIVE_UNFED - tile.consecutive_unfed
-            key = "FEED_CRITICAL" if grace_left <= 1 else "FEED_ROUTINE"
-            tasks.append(Task("FEED", tile, BASE_URGENCY[key]))
-            tasks.append(Task("CARE", tile, BASE_URGENCY["CARE"]))
+        if tile.kind in ("COOP", "PASTURE"):
+            if tile.animal is None:
+                tasks.append(Task("PLACE", tile, BASE_URGENCY["PLACE"]))
+            else:
+                if tile.yield_units > 0:
+                    tasks.append(Task("HARVEST", tile, BASE_URGENCY["HARVEST_FRESH"]))
+                if not tile.fed_today:
+                    grace_left = MAX_CONSECUTIVE_UNFED - tile.consecutive_unfed
+                    key = "FEED_CRITICAL" if grace_left <= 1 else "FEED_ROUTINE"
+                    tasks.append(Task("FEED", tile, BASE_URGENCY[key]))
+                if not tile.cared_today:
+                    tasks.append(Task("CARE", tile, BASE_URGENCY["CARE"]))
+                if tile.fertilizer_available:
+                    tasks.append(Task("COLLECT_FERTILIZER", tile, BASE_URGENCY["COLLECT_FERTILIZER"]))
+            continue
 
-        if tile.structure is not None and tile.animal is None:
-            tasks.append(Task("PLACE", tile, BASE_URGENCY["PLACE"]))
-
-        if (
-            tile.crop is None
-            and tile.structure is None
-            and tile.animal is None
-            and tile.yield_units == 0
-        ):
-            # Empty, plantable tile. Crop choice is a placeholder (always
-            # WHEAT) — see module docstring.
-            tasks.append(Task("PLANT", tile, BASE_URGENCY["PLANT"]))
+        # tile.kind is None -- empty, unlocked, plantable
+        tasks.append(Task("PLANT", tile, BASE_URGENCY["PLANT"]))
 
     tasks.sort(key=lambda t: t.urgency, reverse=True)
     return tasks
@@ -427,9 +431,7 @@ def shop_aware_sell_plan(farm: FarmState, max_orders: int = 8) -> list[tuple[str
     """
     Sell targeting informed by the real per-shop demand table instead of a
     shop-count proxy. Prioritizes selling products with the lowest expected
-    town/shop demand relative to shed quantity first — those are least
-    likely to get picked up by passive town drains, and most likely to
-    approach SHED_CAPACITY and be destroyed unsold at end-of-day.
+    town/shop demand relative to shed quantity first.
     """
     demand = per_turn_shop_demand(farm.unlocked_shops)
     plan: list[tuple[str, int]] = []
@@ -447,27 +449,20 @@ def shop_aware_sell_plan(farm: FarmState, max_orders: int = 8) -> list[tuple[str
 """
 agent.py — Kaggriculture submission entrypoint.
 
-Rewritten against a REAL observation dump (sample_observation.json).
-CONFIRMED by that file: obs["farms"][obs["player"]] is your farm; money
-lives on the farm dict; tiles is a 10x10 grid, not a flat list; a cell is
-`None` (empty), the string "LOCKED", or (unconfirmed -- no example yet)
-presumably a dict; there is exactly one farmer right now, given as a bare
-[x, y] pair with no id; unlocked_quadrants is a list of name strings.
+Rewritten against the official AGENTS.md / README.md shipped inside the
+installed kaggle_environments package. Both the observation shape and the
+action format below are direct matches to that documentation, not guesses:
 
-STILL NOT CONFIRMED, flagged inline with `# VERIFY:`:
-  1. The shape of an occupied tile (planted/growing/built) -- no example
-     existed in a step-0 observation. Get one after a real PLANT/BUILD.
-  2. The exact expected return format for actions. A single flat list
-     (e.g. ["PLANT", "WHEAT"]) is this pass's best guess, replacing the
-     earlier per-unit-id dict guess now that the observation shows no
-     unit ids at all -- but this is still a guess.
+    return {
+        "farmer": [op, ...args],
+        "hands":  [[op, ...args], ...],   # one per hired hand, in order
+        "market": [[op, ...args], ...],
+    }
 
-The single fastest way to close out both of these: `AGENTS.md` and
-`README.md` ship inside the installed kaggle_environments package itself.
-Reading them directly (you have network access; this sandbox doesn't)
-would very likely settle both in one pass instead of more guess-and-test
-cycles. See the chat response for the exact commands to find and print
-them.
+This is the fix for the earlier version, which returned a bare list
+(["WEST"]) — silently wrong, since the engine expects this dict shape.
+That's almost certainly why reward stayed pinned at exactly $3000 even
+once the observation parsing itself was corrected.
 """
 
 import logging
@@ -476,6 +471,12 @@ from typing import Any
 
 logger = logging.getLogger("kaggriculture_agent")
 logging.basicConfig(level=logging.WARNING)
+
+# Placeholder crop-selection heuristic -- always WHEAT. CROPS in
+# mechanics.py has profiles for CARROT/TOMATO/STRAWBERRY/MELON too; a real
+# selection heuristic (season timing, market price, land-use mix) is the
+# next piece of strategy to build, not this pass.
+DEFAULT_PLANT_CROP = "WHEAT"
 
 
 def parse_observation(obs: dict[str, Any], config: dict[str, Any]) -> FarmState:
@@ -491,31 +492,22 @@ def parse_observation(obs: dict[str, Any], config: dict[str, Any]) -> FarmState:
         for x, cell in enumerate(row)
     ]
 
-    # VERIFY: whether "farmer" becomes a list of [x, y] pairs after a HIRE,
-    # or something else entirely. Handled defensively either way -- a bare
-    # [x, y] pair (current reality) is treated as one farmer; a list of
-    # pairs would be treated as several.
-    raw_farmer = my_farm.get("farmer", [])
-    positions: list[tuple[int, int]]
-    if raw_farmer and isinstance(raw_farmer[0], (int, float)):
-        positions = [(int(raw_farmer[0]), int(raw_farmer[1]))]
-    else:
-        positions = [(int(p[0]), int(p[1])) for p in raw_farmer]
-
-    # Best guess: private["inventories"] is a per-farmer carried-items list
-    # -- its length (1) matched the farmer count (1) exactly in the sample.
-    # Not yet confirmed against a turn where a farmer is actually carrying
-    # something.
+    # private["inventories"][0] is the main farmer; [1:] are hands, in the
+    # same order as farm["hands"].
     raw_inventories = private.get("inventories", [])
-    units: list[UnitState] = [
-        UnitState(
-            unit_id=f"farmer_{i}",
-            x=x,
-            y=y,
-            carrying=raw_inventories[i] if i < len(raw_inventories) else {},
-        )
-        for i, (x, y) in enumerate(positions)
-    ]
+
+    fx, fy = my_farm["farmer"]
+    farmer = UnitState(
+        unit_id="farmer",
+        x=fx,
+        y=fy,
+        carrying=raw_inventories[0] if raw_inventories else {},
+    )
+
+    hands: list[UnitState] = []
+    for i, (hx, hy) in enumerate(my_farm.get("hands", [])):
+        carrying = raw_inventories[i + 1] if i + 1 < len(raw_inventories) else {}
+        hands.append(UnitState(unit_id=f"hand_{i}", x=hx, y=hy, carrying=carrying))
 
     return FarmState(
         step=obs.get("step", 0),
@@ -530,61 +522,67 @@ def parse_observation(obs: dict[str, Any], config: dict[str, Any]) -> FarmState:
         unlocked_quadrants=my_farm.get("unlocked_quadrants", []),
         hires_today=my_farm.get("hires_today", 0),
         tiles=tiles,
-        units=units,
+        farmer=farmer,
+        hands=hands,
     )
 
 
 def _direction_toward(from_x: int, from_y: int, to_x: int, to_y: int) -> str | None:
-    """
-    VERIFY: assumes index 0 of a position pair is x (column, increases
-    EAST) and index 1 is y (row, increases SOUTH) -- a common convention,
-    not yet confirmed. Locked tiles are confirmed passable, so no obstacle
-    avoidance is needed -- straight-line greedy stepping is enough.
-    """
+    """Greedy straight-line stepping -- locked tiles are confirmed
+    passable, so no pathfinding/obstacle-avoidance is needed."""
     dx = to_x - from_x
     dy = to_y - from_y
     if dx == 0 and dy == 0:
-        return None  # already there
+        return None
     if abs(dx) >= abs(dy):
         return "EAST" if dx > 0 else "WEST"
     return "SOUTH" if dy > 0 else "NORTH"
 
 
-def agent(obs: dict[str, Any], config: dict[str, Any]) -> list[Any]:
-    """
-    VERIFY: the return shape -- see module docstring. A single flat
-    action list, matching the single farmer this game currently has.
-    Selling (mechanics/strategy already support it via
-    strategy.shop_aware_sell_plan) is deliberately left out of this pass:
-    with only one action slot available per turn and no confirmed way to
-    combine a move/tile-action with a market order in the same return
-    value, guessing at that combination risks breaking both. Add it back
-    once the return format is confirmed.
-    """
-    try:
-        farm = parse_observation(obs, config)
-    except Exception:
-        logger.exception("parse_observation failed; passing this turn as a safe fallback")
-        return ["PASS"]
-
-    if not farm.units:
-        return ["PASS"]
-
+def _farmer_op(farm: FarmState, market_orders: list[Any]) -> list[Any]:
+    """Decide the main farmer's single op this turn. May append a market
+    order it depends on (buying a seed before it can plant)."""
     tasks = generate_tasks(farm)
     if not tasks:
         return ["PASS"]
 
-    unit = farm.units[0]  # exactly one farmer for now
     task = tasks[0]  # highest urgency
 
-    direction = _direction_toward(unit.x, unit.y, task.tile.x, task.tile.y)
+    if task.kind == "PLANT" and farm.seeds.get(DEFAULT_PLANT_CROP, 0) <= 0:
+        cost = CROPS[DEFAULT_PLANT_CROP].seed_cost
+        if farm.money >= cost:
+            market_orders.append(["BUY_SEED", DEFAULT_PLANT_CROP, 1])
+        # keep walking toward the tile in the meantime -- no reason to
+        # idle while the seed purchase is in flight
+
+    direction = _direction_toward(farm.farmer.x, farm.farmer.y, task.tile.x, task.tile.y)
     if direction is not None:
         return [direction]
 
-    # Already on the target tile -- perform its action.
     if task.kind == "PLANT":
-        # VERIFY: PLANT's real argument shape; WHEAT is a placeholder
-        # crop choice, not a real selection heuristic.
-        return ["PLANT", "WHEAT"]
+        if farm.seeds.get(DEFAULT_PLANT_CROP, 0) <= 0:
+            return ["PASS"]  # on the tile, but the seed hasn't landed yet
+        return ["PLANT", DEFAULT_PLANT_CROP]
+
     return [task.kind]
+
+
+def agent(obs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    try:
+        farm = parse_observation(obs, config)
+    except Exception:
+        logger.exception("parse_observation failed; passing this turn as a safe fallback")
+        return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    market_orders: list[Any] = []
+    farmer_op = _farmer_op(farm, market_orders)
+
+    for item, qty in shop_aware_sell_plan(farm):
+        market_orders.append(["SELL", item, qty])
+
+    # Hands aren't hired in this pass, so there's nothing to control yet --
+    # HIRE and per-hand task assignment are the next real piece of work.
+    hand_ops: list[Any] = []
+
+    return {"farmer": farmer_op, "hands": hand_ops, "market": market_orders}
 

@@ -1,9 +1,13 @@
 """
 scripts/test_harness.py — Run this anywhere with real network access: a
-Kaggle notebook cell, a free VM, or CI. This project's history: every
-synthetic-obs test across three prior agent files had at least one flaw
-that took extra debugging to catch. A real harness run doesn't have that
-failure mode.
+free VM, CI, or a terminal (notebooks/run_episode.ipynb is the notebook
+equivalent). This project's history: every synthetic-obs test across
+three prior agent files had at least one flaw that took extra debugging
+to catch. A real harness run doesn't have that failure mode.
+
+Observation schema and action format are both confirmed against the
+official AGENTS.md/README.md at this point -- this script is for
+re-running episodes as the strategy evolves, not for resolving unknowns.
 
 Usage (from the repo root):
     pip install -r requirements.txt
@@ -29,10 +33,8 @@ def main() -> None:
         print("Run: pip install -r requirements.txt")
         sys.exit(1)
 
-    # VERIFY: the exact registered environment id. "kaggriculture" is a
-    # guess based on the competition's name — check `kaggle_environments.envs`
-    # or the competition page for the real id if this raises.
-    env = make("kaggriculture")
+    # Confirmed correct against a real run.
+    env = make("kaggriculture", configuration={"episodeSteps": 720}, debug=True)
 
     steps = env.run([agent, "random"])
 
@@ -40,10 +42,9 @@ def main() -> None:
     print("Episode finished.")
     print("Final reward (should reflect farm['money'] at episode end):")
     print(json.dumps(final_state.get("reward"), indent=2))
+    print("If this is exactly 3000.0, restart the interpreter/kernel before")
+    print("re-running — a stale cached import of agent.py is the most common cause.")
 
-    # Dump the first observation so the two `# VERIFY:` spots in
-    # src/kaggriculture/agent.py can be resolved against the real schema
-    # instead of guessed at.
     first_obs = steps[0][0]["observation"]
     print("\nFirst observation top-level keys:", list(first_obs.keys()))
     out_path = REPO_ROOT / "sample_observation.json"

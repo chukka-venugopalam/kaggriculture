@@ -1,10 +1,10 @@
 # Kaggriculture
 
-Fresh build, scaffolded from a verified-mechanics report and now also a
-real observation dump pulled from a live Kaggle run
-(`tests/fixtures/sample_observation.json`). `mechanics.py`,
-`state.py::size_keeper_pool()`, and the whole parsing layer in `agent.py`
-are confirmed against real data, not guessed.
+Fresh build. Every piece of this -- observation schema, tile shapes, and
+the action return format -- is confirmed directly against the official
+`AGENTS.md`/`README.md` shipped inside the installed `kaggle_environments`
+package, plus a real observation pulled from a live run. Nothing here is
+guessed or reconstructed from a prior agent file's comments.
 
 ## Layout
 
@@ -31,73 +31,58 @@ commit the new output:**
 python scripts/build_submission.py
 ```
 
-## What's confirmed against real data -- don't re-derive
+## Confirmed, straight from AGENTS.md / README.md
 
-- The observation shape: `obs["farms"][obs["player"]]` is your farm;
-  `money` lives on the farm dict; `tiles` is a 10x10 grid (list of 10
-  rows of 10 cells), not a flat list; a cell is `None` (empty, plantable),
-  the string `"LOCKED"` (unbought quadrant), or a dict once something is
-  planted/built there; `unlocked_quadrants` is a list of name strings
-  (`["NW"]`), not a count; there is exactly one farmer, given as a bare
-  `[x, y]` pair with no id
-- `mechanics.py` -- action vocabulary, crop yield/decay table, shed cap,
-  hire cost formula, shop demand table
-- `state.py::size_keeper_pool()` -- verified stable-pool formula
-- `strategy.py::harvest_urgency()` -- decay-driven, reads
-  `max_lifespan_step` directly instead of inferring decay
-- `agent.py` now actually moves the farmer toward the highest-urgency
-  task instead of doing nothing -- verified against the real sample
-  observation, not just a synthetic one (`tests/test_agent_parsing.py`)
+- **Action format** (this was the actual bug behind reward staying pinned
+  at $3000 -- the engine expects a dict, not a bare list):
+  ```py
+  {
+    "farmer": [op, ...args],
+    "hands":  [[op, ...args], ...],
+    "market": [[op, ...args], ...],
+  }
+  ```
+- **Tile shape** is `kind`-discriminated: `None` (empty), `"LOCKED"`, or a
+  dict with `"kind"` one of `"PLANT"`, `"WEED"`, `"COOP"`, `"PASTURE"` --
+  each with its own documented fields (`state.py::TileState.from_raw`
+  matches this exactly, field for field)
+- `money` lives on the farm dict; `tiles` is a 10x10 grid (`tiles[y][x]`);
+  the main farmer is one `[x, y]` pair (`"farmer"`), hired hands are a
+  separate list (`"hands"`); `unlocked_quadrants` is a list of names
+- Crop table (seed cost, base price, yield timing) matches the README's
+  Object Types table exactly, including per-crop unfertilized caps
+- `mechanics.py` -- action vocabulary, shed cap, hire cost formula, shop
+  demand table, market price shape functions
+- `strategy.py::harvest_urgency()` -- decay-driven for one-time crops,
+  reading `max_lifespan_step` directly
 
-## What's still genuinely open
+## Verified against a real episode
 
-1. **The shape of an occupied tile.** The one real observation available
-   is from turn 0, before anything was planted -- every unlocked cell is
-   just `None`. The dict-shape fields in `TileState.from_raw()` (crop,
-   yield_units, max_lifespan_step, ...) are carried over from the
-   verified-mechanics report as a best guess, not confirmed against a
-   real occupied cell yet.
-2. **The exact action return format.** `agent()` currently returns a
-   single flat list (e.g. `["WEST"]`, `["PLANT", "WHEAT"]`), replacing an
-   earlier per-unit-id dict guess now that the real observation shows no
-   unit ids at all. Still a guess.
-
-**The fastest way to close both out**: `AGENTS.md` and `README.md` ship
-*inside* the installed `kaggle_environments` package. Run this in the
-notebook (or any cell with the package installed):
-
-```python
-import kaggle_environments, os
-
-pkg_dir = os.path.dirname(kaggle_environments.__file__)
-for root, dirs, files in os.walk(pkg_dir):
-    if "AGENTS.md" in files:
-        print(root)
+Ran the exact sample observation through the rewritten agent:
 ```
+{"farmer": ["WEST"], "hands": [], "market": [["BUY_SEED", "WHEAT", 1]]}
+```
+Moves toward the nearest empty tile and queues a wheat seed purchase in
+parallel -- a real decision, correctly shaped, not an idle turn.
+`submission/main.py` (the flattened build) produces the byte-identical
+result.
 
-Then `!cat <that path>/AGENTS.md` and `!cat <that path>/README.md`, and
-share the output back. That very likely settles both open items directly
-instead of more guess-and-test cycles.
+## What's still open
 
-**Not implemented yet, on purpose:**
-- Selling (`strategy.py::shop_aware_sell_plan` exists but isn't called
-  from `agent()`) -- deliberately left out until the return format is
-  confirmed, since combining a move/tile-action with a market order in
-  one turn isn't confirmed to work
-- A real crop-selection heuristic for empty tiles (currently always
-  plants WHEAT as a placeholder)
-- Multiple farmers / hiring logic (there is exactly one farmer right now;
-  parsing is written to handle more if `"farmer"` becomes a list of pairs,
-  but that shape is unconfirmed)
+- **Ongoing-crop decay** (tomato/strawberry) isn't modeled --
+  `max_lifespan_step` is always `-1` for these; the engine tracks their
+  decay trigger by cumulative production count instead, which isn't
+  derivable from a single observation
+- **Crop selection** for empty tiles is a placeholder (always WHEAT)
+- **Hiring / hands** aren't used yet -- `hands` is always `[]`; the next
+  real piece of work once the single-farmer loop is confirmed working in
+  a real episode
+- **Land buying** (`BUY_LAND`) isn't attempted yet
 
 ## Deliberately left open (tunable -- resolve via real self-play, not a guess)
 
-- `MAX_QUADRANTS` -- prior comments disagreed (2 vs. 3); real 9-game data
-  shows all 9 winners reaching a 3rd quadrant by day 9-11, which favors 3,
-  but that's not a direct A/B test
-- Opening animal ratio -- the one undefeated player in the 9-game sample
-  opened 0 goose / 3 cow / 2 sheep; every other winner opened 0/2/2
-- Unit ceiling -- 13 held across all 9 real games, never exceeded
+- `MAX_QUADRANTS` -- how many quadrants to actually buy, and when
+- Opening animal ratio and unit ceiling once hiring is implemented
 
 ## Get this running on Kaggle, no local setup
 
@@ -107,7 +92,9 @@ instead of more guess-and-test cycles.
    a new notebook)
 3. Turn **Internet ON** in the notebook's settings panel (right sidebar)
 4. Edit `REPO_URL` in the first code cell
-5. Run All
+5. Run All -- **restart the session first if you've run an older version
+   of `agent.py` in the same kernel already**; Python won't reload a
+   module it's already imported just because the file on disk changed
 
 ## Tests
 
@@ -118,6 +105,4 @@ pytest tests/
 
 `tests/test_agent_parsing.py` runs against a real observation
 (`tests/fixtures/sample_observation.json`), not just hand-built synthetic
-dicts -- the specific gap this project's earlier 50-test synthetic-obs
-suite had. It confirms parsing is correct as far as one step-0 sample
-allows; it can't confirm the two open items above.
+dicts.

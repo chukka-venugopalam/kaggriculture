@@ -13,7 +13,7 @@ this suite is no substitute for it, the same way this project's earlier
 from __future__ import annotations
 
 from mechanics import decay_urgency, hire_cost, is_decaying, per_turn_shop_demand
-from state import FarmState, TileState, size_keeper_pool
+from state import FarmState, TileState, UnitState, size_keeper_pool
 from strategy import generate_tasks, harvest_urgency
 
 
@@ -74,7 +74,8 @@ def test_generate_tasks_skips_locked_tiles() -> None:
         unlocked_shops=[],
         unlocked_quadrants=["NW"],
         hires_today=0,
-        tiles=[TileState(x=0, y=0, locked=True, crop="WHEAT", consecutive_unwatered=1)],
-        units=[],
+        tiles=[TileState(x=0, y=0, locked=True, kind="PLANT", crop="WHEAT", consecutive_unwatered=1)],
+        farmer=UnitState(unit_id="farmer", x=4, y=4),
+        hands=[],
     )
     assert generate_tasks(farm) == []

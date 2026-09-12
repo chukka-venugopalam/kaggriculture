@@ -81,38 +81,43 @@ MAX_MARKET_ORDERS_PER_TURN: int = 10  # extras silently dropped
 
 @dataclass(frozen=True)
 class CropProfile:
+    seed_cost: int
+    base_price: int
     first_yield_day: int
-    max_yield_day: int | None  # None for "ongoing" crops (tomato/strawberry)
+    max_yield_day: int  # confirmed exact for all 5 crops, incl. ongoing ones
     max_yield: int  # fertilized max, per confirmed table
     max_yield_unfertilized: int | None = None
     ongoing_interval_days: int | None = None  # tomato=1, strawberry=2
     ongoing_productions: int | None = None  # both ongoing crops: 4
 
 
+# Confirmed against README.md's Object Types table exactly.
 CROPS: dict[str, CropProfile] = {
-    "WHEAT": CropProfile(first_yield_day=2, max_yield_day=4, max_yield=6, max_yield_unfertilized=4),
-    "CARROT": CropProfile(first_yield_day=2, max_yield_day=3, max_yield=4, max_yield_unfertilized=3),
-    "MELON": CropProfile(first_yield_day=10, max_yield_day=12, max_yield=6),
-    "TOMATO": CropProfile(first_yield_day=8, max_yield_day=None, max_yield=4, ongoing_interval_days=1, ongoing_productions=4),
-    "STRAWBERRY": CropProfile(first_yield_day=10, max_yield_day=None, max_yield=4, ongoing_interval_days=2, ongoing_productions=4),
+    "WHEAT": CropProfile(seed_cost=10, base_price=25, first_yield_day=2, max_yield_day=4, max_yield=6, max_yield_unfertilized=4),
+    "CARROT": CropProfile(seed_cost=20, base_price=35, first_yield_day=2, max_yield_day=3, max_yield=4, max_yield_unfertilized=3),
+    "MELON": CropProfile(seed_cost=80, base_price=250, first_yield_day=10, max_yield_day=10, max_yield=6),
+    "TOMATO": CropProfile(seed_cost=50, base_price=60, first_yield_day=8, max_yield_day=11, max_yield=4, ongoing_interval_days=1, ongoing_productions=4),
+    "STRAWBERRY": CropProfile(seed_cost=100, base_price=120, first_yield_day=10, max_yield_day=16, max_yield=4, ongoing_interval_days=2, ongoing_productions=4),
 }
 
 
-def is_decaying(max_lifespan_step: int | None, current_step: int) -> bool:
-    """True once a tile has passed max_lifespan_step. Reads the field
-    directly rather than inferring decay from yield_units or age — exactly
-    the mistake every prior agent version made."""
-    if max_lifespan_step is None:
+def is_decaying(max_lifespan_step: int, current_step: int) -> bool:
+    """True once a tile has passed max_lifespan_step. -1 means "not
+    applicable" (an ongoing crop, whose decay trigger isn't step-based) —
+    treated as never-decaying here since that path isn't modeled yet."""
+    if max_lifespan_step is None or max_lifespan_step < 0:
         return False
     return current_step > max_lifespan_step
 
 
-def decay_urgency(max_lifespan_step: int | None, current_step: int) -> float:
+def decay_urgency(max_lifespan_step: int, current_step: int) -> float:
     """Higher = more urgent to harvest NOW. Once decaying, yield_units drops
     by 1 every other turn until the tile becomes a weed — so every 2 turns
     of delay past max_lifespan_step is a full unit of yield, permanently
-    lost."""
-    if max_lifespan_step is None:
+    lost. Ongoing crops (max_lifespan_step == -1) aren't modeled here yet —
+    their decay trigger is a cumulative-production count, not a step
+    number, and isn't derivable from a single observation."""
+    if max_lifespan_step is None or max_lifespan_step < 0:
         return 0.0
     turns_past_decay = current_step - max_lifespan_step
     if turns_past_decay <= 0:

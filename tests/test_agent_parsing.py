@@ -1,12 +1,8 @@
 """
 Tests against a REAL observation (tests/fixtures/sample_observation.json,
-pulled from an actual Kaggle run), not a hand-built synthetic dict. This
-is the specific gap flagged repeatedly in this project's history: passing
-against synthetic data invented to match your own schema guesses checks
-internal consistency, not real-world correctness. This suite checks the
-latter, as far as one real (step-0, single-farmer, nothing-planted-yet)
-sample allows -- it can't confirm the occupied-tile shape or the action
-return format, since no example of either existed in this sample.
+pulled from an actual Kaggle run), not a hand-built synthetic dict --
+checks real-world correctness, not just internal consistency with our own
+schema guesses.
 """
 
 from __future__ import annotations
@@ -34,7 +30,7 @@ def test_parses_real_observation_without_error() -> None:
 
 def test_parses_all_100_grid_cells() -> None:
     farm = parse_observation(_load(), config={})
-    assert len(farm.tiles) == 100  # 10x10, confirmed grid shape
+    assert len(farm.tiles) == 100  # 10x10 grid
 
 
 def test_locked_and_unlocked_cells_split_correctly() -> None:
@@ -46,10 +42,10 @@ def test_locked_and_unlocked_cells_split_correctly() -> None:
     assert len(locked) == 75
 
 
-def test_single_farmer_parsed_at_confirmed_position() -> None:
+def test_farmer_parsed_at_confirmed_position_with_no_hands_yet() -> None:
     farm = parse_observation(_load(), config={})
-    assert len(farm.units) == 1
-    assert (farm.units[0].x, farm.units[0].y) == (4, 4)
+    assert (farm.farmer.x, farm.farmer.y) == (4, 4)
+    assert farm.hands == []  # hires_today == 0 in the sample
 
 
 def test_unlocked_quadrants_is_a_name_list_not_a_count() -> None:
@@ -57,11 +53,21 @@ def test_unlocked_quadrants_is_a_name_list_not_a_count() -> None:
     assert farm.unlocked_quadrants == ["NW"]
 
 
-def test_agent_returns_a_list_and_does_not_crash() -> None:
-    # Doesn't confirm the return format is *correct* (that's still an open
-    # question -- see agent.py's module docstring) -- only that this
-    # first pass runs against real data without raising.
+def test_agent_returns_the_confirmed_dict_shape() -> None:
     obs = _load()
     result = agent(obs, config={})
-    assert isinstance(result, list)
-    assert len(result) >= 1
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"farmer", "hands", "market"}
+    assert isinstance(result["farmer"], list) and len(result["farmer"]) >= 1
+    assert isinstance(result["hands"], list)
+    assert isinstance(result["market"], list)
+
+
+def test_agent_moves_toward_nearest_plantable_tile_on_a_fresh_farm() -> None:
+    # On a completely empty farm, every unlocked tile is plantable, so the
+    # farmer should move rather than PASS -- (4,4) itself is plantable, but
+    # it's not the first one in row-major iteration order, so a real
+    # decision (movement) is expected here, not an idle turn.
+    obs = _load()
+    result = agent(obs, config={})
+    assert result["farmer"][0] in ("NORTH", "SOUTH", "EAST", "WEST")
