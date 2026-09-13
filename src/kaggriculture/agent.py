@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from mechanics import CROPS
+from mechanics import CROPS, hire_cost
 from state import FarmState, TileState, UnitState
 from strategy import generate_tasks, shop_aware_sell_plan
 
@@ -95,32 +95,84 @@ def _direction_toward(from_x: int, from_y: int, to_x: int, to_y: int) -> str | N
     return "SOUTH" if dy > 0 else "NORTH"
 
 
-def _farmer_op(farm: FarmState, market_orders: list[Any]) -> list[Any]:
-    """Decide the main farmer's single op this turn. May append a market
-    order it depends on (buying a seed before it can plant)."""
+# Keep this much cash in reserve on top of a hire's own cost, so a HIRE
+# order doesn't get queued the same turn that empties the bank for a seed
+# purchase or land buy.
+HIRE_MONEY_BUFFER = 50
+
+
+def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]:
+    """
+    Greedily assigns the highest-urgency remaining task to each unit in
+    turn (farmer first, then hands in the order they appear), moving
+    toward the task's tile if not already there. Units CAN share a tile
+    (confirmed), so two units can legitimately be sent to the same tile
+    to do two different things there in the same turn.
+
+    Known limitation: assignment is by task-priority order only, not by
+    which unit is actually closest -- a hand can end up walking further
+    than necessary while a nearer task goes to someone else. Good enough
+    for a first pass; real closest-unit assignment is a natural next
+    improvement once this is confirmed working.
+    """
     tasks = generate_tasks(farm)
-    if not tasks:
-        return ["PASS"]
+    units = [farm.farmer, *farm.hands]
+    ops: list[list[Any]] = []
+    claimed: set[int] = set()
+    market_orders: list[Any] = []
+    wheat_seeds_committed = 0
+    seed_buy_queued = False
 
-    task = tasks[0]  # highest urgency
+    for unit in units:
+        op: list[Any] = ["PASS"]
+        for i, task in enumerate(tasks):
+            if i in claimed:
+                continue
 
-    if task.kind == "PLANT" and farm.seeds.get(DEFAULT_PLANT_CROP, 0) <= 0:
-        cost = CROPS[DEFAULT_PLANT_CROP].seed_cost
-        if farm.money >= cost:
-            market_orders.append(["BUY_SEED", DEFAULT_PLANT_CROP, 1])
-        # keep walking toward the tile in the meantime -- no reason to
-        # idle while the seed purchase is in flight
+            if task.kind == "PLANT":
+                available = farm.seeds.get(DEFAULT_PLANT_CROP, 0) - wheat_seeds_committed
+                if available <= 0:
+                    # Confirmed: if two units both PLANT the same turn
+                    # with insufficient seed for both, NEITHER plants.
+                    # Send at most one unit at this task per seed actually
+                    # in hand -- queue a purchase and let this unit walk
+                    # over in the meantime, but leave the task claimed so
+                    # no second unit piles onto the same shortfall.
+                    claimed.add(i)
+                    if not seed_buy_queued:
+                        cost = CROPS[DEFAULT_PLANT_CROP].seed_cost
+                        if farm.money >= cost:
+                            market_orders.append(["BUY_SEED", DEFAULT_PLANT_CROP, 1])
+                        seed_buy_queued = True
+                    direction = _direction_toward(unit.x, unit.y, task.tile.x, task.tile.y)
+                    op = [direction] if direction is not None else ["PASS"]
+                    break
 
-    direction = _direction_toward(farm.farmer.x, farm.farmer.y, task.tile.x, task.tile.y)
-    if direction is not None:
-        return [direction]
+            claimed.add(i)
+            direction = _direction_toward(unit.x, unit.y, task.tile.x, task.tile.y)
+            if direction is not None:
+                op = [direction]
+            elif task.kind == "PLANT":
+                op = ["PLANT", DEFAULT_PLANT_CROP]
+                wheat_seeds_committed += 1
+            else:
+                op = [task.kind]
+            break
 
-    if task.kind == "PLANT":
-        if farm.seeds.get(DEFAULT_PLANT_CROP, 0) <= 0:
-            return ["PASS"]  # on the tile, but the seed hasn't landed yet
-        return ["PLANT", DEFAULT_PLANT_CROP]
+        ops.append(op)
 
-    return [task.kind]
+    # More backlog than hands to cover it, and we can afford another --
+    # hire one. The new hand shows up next turn, not this one.
+    if len(tasks) > len(units):
+        cost = hire_cost(farm.hires_today)
+        if farm.money >= cost + HIRE_MONEY_BUFFER:
+            market_orders.append(["HIRE"])
+
+    for item, qty in shop_aware_sell_plan(farm):
+        market_orders.append(["SELL", item, qty])
+
+    farmer_op, hand_ops = ops[0], ops[1:]
+    return farmer_op, hand_ops, market_orders
 
 
 def agent(obs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -130,14 +182,5 @@ def agent(obs: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         logger.exception("parse_observation failed; passing this turn as a safe fallback")
         return {"farmer": ["PASS"], "hands": [], "market": []}
 
-    market_orders: list[Any] = []
-    farmer_op = _farmer_op(farm, market_orders)
-
-    for item, qty in shop_aware_sell_plan(farm):
-        market_orders.append(["SELL", item, qty])
-
-    # Hands aren't hired in this pass, so there's nothing to control yet --
-    # HIRE and per-hand task assignment are the next real piece of work.
-    hand_ops: list[Any] = []
-
+    farmer_op, hand_ops, market_orders = _decide_ops(farm)
     return {"farmer": farmer_op, "hands": hand_ops, "market": market_orders}

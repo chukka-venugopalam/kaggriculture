@@ -73,16 +73,18 @@ the fix.
 
 ## What's still open
 
-- **Whether a full episode now nets positive money** -- the format and
-  sell-threshold bugs are both fixed and unit-tested, but neither of us
-  has run a complete 720-turn episode against the fix yet. That's the
-  next real test.
+- **Whether hiring actually helps in a real episode** -- HIRE fires when
+  task backlog exceeds available units and the buffer is affordable
+  (`HIRE_MONEY_BUFFER = 50`), and each hand gets assigned its own task the
+  same way the farmer does, including the two-units-can't-plant-the-same-
+  scarce-seed guard. Unit-tested; not yet run against a real 720-turn
+  episode.
+- **Task assignment is priority-order, not closest-unit** -- a hand can
+  end up walking further than necessary while a nearer task goes to
+  someone else assigned earlier in the loop
 - **Ongoing-crop decay** (tomato/strawberry) isn't modeled --
-  `max_lifespan_step` is always `-1` for these; the engine tracks their
-  decay trigger by cumulative production count instead, which isn't
-  derivable from a single observation
+  `max_lifespan_step` is always `-1` for these
 - **Crop selection** for empty tiles is a placeholder (always WHEAT)
-- **Hiring / hands** aren't used yet -- `hands` is always `[]`
 - **Land buying** (`BUY_LAND`) isn't attempted yet
 
 ## Deliberately left open (tunable -- resolve via real self-play, not a guess)
