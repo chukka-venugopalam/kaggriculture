@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from agent import _decide_ops, agent, parse_observation
+from mechanics import MAX_MARKET_ORDERS_PER_TURN, QUADRANT_NAMES
 from state import FarmState, TileState, UnitState
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sample_observation.json"
@@ -64,14 +65,24 @@ def test_agent_returns_the_confirmed_dict_shape() -> None:
     assert isinstance(result["market"], list)
 
 
-def test_agent_moves_toward_nearest_plantable_tile_on_a_fresh_farm() -> None:
-    # On a completely empty farm, every unlocked tile is plantable, so the
-    # farmer should move rather than PASS -- (4,4) itself is plantable, but
-    # it's not the first one in row-major iteration order, so a real
-    # decision (movement) is expected here, not an idle turn.
+def test_agent_does_not_walk_away_from_an_equally_urgent_tile_under_its_feet() -> None:
+    # Regression test for a real inefficiency: with many equally-urgent
+    # empty tiles (a fresh farm), a lone farmer used to walk to whichever
+    # tile was first in list order even when it was already standing on
+    # an equally valid one. It should recognize its own tile as just as
+    # good (distance 0) and act there instead of wasting the whole walk --
+    # here, that means queuing the seed purchase and waiting, not moving.
     obs = _load()
     result = agent(obs, config={})
-    assert result["farmer"][0] in ("NORTH", "SOUTH", "EAST", "WEST")
+    assert result["farmer"] == ["PASS"]
+    assert ["BUY_SEED", "WHEAT", 1] in result["market"]
+
+
+def test_agent_plants_immediately_once_seed_is_in_hand() -> None:
+    obs = _load()
+    obs["private"]["seeds"]["WHEAT"] = 1  # as if the queued purchase already landed
+    result = agent(obs, config={})
+    assert result["farmer"] == ["PLANT", "WHEAT"]
 
 
 def _bare_farm(**overrides) -> FarmState:
@@ -135,3 +146,57 @@ def test_decide_ops_does_not_double_commit_scarce_seed() -> None:
     farmer_op, hand_ops, _ = _decide_ops(farm)
     plant_ops = [op for op in [farmer_op, *hand_ops] if op[0] == "PLANT"]
     assert len(plant_ops) == 1
+
+
+def _mostly_planted_nw(empty_count: int) -> list[TileState]:
+    """25 NW tiles, all but `empty_count` already planted with wheat."""
+    planted = [
+        TileState(x=x, y=y, kind="PLANT", crop="WHEAT", watered_today=True)
+        for x in range(5)
+        for y in range(5)
+    ]
+    n_planted = 25 - empty_count
+    return planted[:n_planted] + [TileState(x=3, y=4), TileState(x=4, y=4)][: max(0, 25 - n_planted)]
+
+
+def test_decide_ops_buys_land_once_empty_tiles_run_low() -> None:
+    farm = _bare_farm(money=5000.0, unlocked_quadrants=["NW"], tiles=_mostly_planted_nw(empty_count=2))
+    _, _, market_orders = _decide_ops(farm)
+    assert ["BUY_LAND"] in market_orders
+
+
+def test_decide_ops_skips_land_when_plenty_of_room_left() -> None:
+    farm = _bare_farm(
+        money=5000.0,
+        unlocked_quadrants=["NW"],
+        tiles=[TileState(x=x, y=y) for x in range(5) for y in range(5)],  # all 25 empty
+    )
+    _, _, market_orders = _decide_ops(farm)
+    assert ["BUY_LAND"] not in market_orders
+
+
+def test_decide_ops_skips_land_once_fully_unlocked() -> None:
+    farm = _bare_farm(
+        money=5000.0,
+        unlocked_quadrants=list(QUADRANT_NAMES),  # all 4 already owned
+        tiles=[TileState(x=0, y=0)],  # even with a lone empty tile "shortage"
+    )
+    _, _, market_orders = _decide_ops(farm)
+    assert ["BUY_LAND"] not in market_orders
+
+
+def test_decide_ops_skips_land_when_money_too_low() -> None:
+    farm = _bare_farm(money=1200.0, unlocked_quadrants=["NW"], tiles=_mostly_planted_nw(empty_count=2))
+    _, _, market_orders = _decide_ops(farm)
+    assert ["BUY_LAND"] not in market_orders  # $1000 cost + $500 buffer > $1200
+
+
+def test_decide_ops_never_exceeds_market_order_cap() -> None:
+    farm = _bare_farm(
+        money=5000.0,
+        unlocked_quadrants=["NW"],
+        shed={k: 50 for k in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")},
+        tiles=_mostly_planted_nw(empty_count=2),
+    )
+    _, _, market_orders = _decide_ops(farm)
+    assert len(market_orders) <= MAX_MARKET_ORDERS_PER_TURN

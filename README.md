@@ -56,35 +56,35 @@ python scripts/build_submission.py
 - `strategy.py::harvest_urgency()` -- decay-driven for one-time crops,
   reading `max_lifespan_step` directly
 
-## Verified against a real episode
+## Verified against real episodes
 
-A full 720-turn run (via a real Kaggle notebook) confirmed the action
-format fix: the farmer walked, bought a seed, and planted, exactly on
-schedule. It also surfaced a real bug -- `shop_aware_sell_plan` only sold
-once the shed was nearly full, so with one or two crop tiles it silently
-never sold anything, and money went steadily down (seed purchases with
-no offsetting sales). Fixed to sell unconditionally, matching AGENTS.md's
-own reference agent, and confirmed directly:
-```
-{"farmer": ["WEST"], "hands": [], "market": [["BUY_SEED","WHEAT",1], ["SELL","WHEAT",3]]}
-```
+- A full 720-turn run confirmed the action-format fix and the sell-plan
+  fix together: 3934.0 (from 3000 starting money) with just the farmer
+  working alone.
+- Hiring, once capped correctly at 3/day, took the same run to 5855.0 --
+  roughly 3x the net profit (934 -> 2855).
+- Land-buying and the nearest-tied-task fix are new this pass, verified
+  directly (7 scenarios covering every trigger condition) but not yet
+  run in a full episode.
+
 `submission/main.py` re-verified identical to the modular source after
-the fix.
+every change above.
 
 ## What's still open
 
-- **Whether the daily hire cap actually restores or beats the 3934
-  no-hiring baseline in a real episode** -- the runaway-hire bug (hiring
-  fired every turn; fibonacci daily cost crashed a real run from 3000 to
-  40) is fixed and directly regression-tested, but not yet re-run for
-  real. `MAX_HIRES_PER_DAY = 3` is a starting guess, not tuned.
-- **Task assignment is priority-order, not closest-unit** -- a hand can
-  end up walking further than necessary while a nearer task goes to
-  someone else assigned earlier in the loop
+- **Whether land-buying and the nearest-tied-task fix actually improve
+  the real result** -- both are directly simulated and unit-tested (7
+  hand-verified scenarios: nearest-tied-task selection, land purchase
+  triggering/not-triggering in every relevant case, the market-order cap
+  never being exceeded), but not yet run end-to-end for real.
+- **Task assignment is a greedy nearest-pair heuristic**, not a true
+  optimal assignment -- fine for a handful of units against a few dozen
+  tasks, not guaranteed optimal
 - **Ongoing-crop decay** (tomato/strawberry) isn't modeled --
   `max_lifespan_step` is always `-1` for these
 - **Crop selection** for empty tiles is a placeholder (always WHEAT)
-- **Land buying** (`BUY_LAND`) isn't attempted yet
+- `LAND_BUY_MIN_EMPTY_TILES = 3` and `LAND_BUY_MONEY_BUFFER = 500` are
+  starting guesses, not tuned
 
 ## Deliberately left open (tunable -- resolve via real self-play, not a guess)
 
