@@ -73,12 +73,11 @@ the fix.
 
 ## What's still open
 
-- **Whether hiring actually helps in a real episode** -- HIRE fires when
-  task backlog exceeds available units and the buffer is affordable
-  (`HIRE_MONEY_BUFFER = 50`), and each hand gets assigned its own task the
-  same way the farmer does, including the two-units-can't-plant-the-same-
-  scarce-seed guard. Unit-tested; not yet run against a real 720-turn
-  episode.
+- **Whether the daily hire cap actually restores or beats the 3934
+  no-hiring baseline in a real episode** -- the runaway-hire bug (hiring
+  fired every turn; fibonacci daily cost crashed a real run from 3000 to
+  40) is fixed and directly regression-tested, but not yet re-run for
+  real. `MAX_HIRES_PER_DAY = 3` is a starting guess, not tuned.
 - **Task assignment is priority-order, not closest-unit** -- a hand can
   end up walking further than necessary while a nearer task goes to
   someone else assigned earlier in the loop

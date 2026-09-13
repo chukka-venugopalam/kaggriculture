@@ -102,6 +102,19 @@ def test_decide_ops_hires_when_backlog_exceeds_units_and_affordable() -> None:
     assert ["HIRE"] in market_orders
 
 
+def test_decide_ops_stops_hiring_at_the_daily_cap() -> None:
+    # Regression test for a real bug: hiring had no cap, so with a large
+    # backlog (any farm early on) it fired every single turn, and cost
+    # (fib(hires_today), resetting daily) escalated fast enough within
+    # one day to crash a 3000-money bank down to ~40 in a single real run.
+    farm = _bare_farm(
+        hires_today=3,  # already at MAX_HIRES_PER_DAY
+        tiles=[TileState(x=i, y=0) for i in range(20)],  # huge backlog, still shouldn't hire
+    )
+    _, _, market_orders = _decide_ops(farm)
+    assert ["HIRE"] not in market_orders
+
+
 def test_decide_ops_skips_hire_when_money_too_low() -> None:
     farm = _bare_farm(money=10.0, tiles=[TileState(x=i, y=0) for i in range(10)])
     _, _, market_orders = _decide_ops(farm)

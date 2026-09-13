@@ -100,6 +100,17 @@ def _direction_toward(from_x: int, from_y: int, to_x: int, to_y: int) -> str | N
 # purchase or land buy.
 HIRE_MONEY_BUFFER = 50
 
+# Hands disappear at the end of every day and must be re-hired from
+# scratch (confirmed) -- and cost is fib(hires_today), resetting daily,
+# so it escalates fast WITHIN a day: 1, 1, 2, 3, 5, 8, 13, 21, ... A
+# "backlog exceeds units" trigger alone never stops firing early on --
+# 25 empty tiles outnumbers even a dozen units -- so a real run hired
+# every single turn and the escalating fibonacci cost crashed the bank
+# from 3000 to 40 in one day. Capped here instead: at most this many
+# hires per day, regardless of backlog. Tunable -- 3 is a starting
+# guess for a 25-tile (NW-only) farm, not derived from anything.
+MAX_HIRES_PER_DAY = 3
+
 
 def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]:
     """
@@ -162,8 +173,9 @@ def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]
         ops.append(op)
 
     # More backlog than hands to cover it, and we can afford another --
-    # hire one. The new hand shows up next turn, not this one.
-    if len(tasks) > len(units):
+    # hire one, up to the daily cap. The new hand shows up next turn, not
+    # this one.
+    if len(tasks) > len(units) and farm.hires_today < MAX_HIRES_PER_DAY:
         cost = hire_cost(farm.hires_today)
         if farm.money >= cost + HIRE_MONEY_BUFFER:
             market_orders.append(["HIRE"])
