@@ -40,6 +40,7 @@ BASE_URGENCY: dict[str, float] = {
     "HARVEST_DECAYING": 90.0,
     "PLACE": 80.0,
     "FEED_ROUTINE": 60.0,
+    "PLANT_ABUNDANT": 65.0,  # see generate_tasks() -- only used when empty land >= unit count
     "WATER_ROUTINE": 55.0,
     "HARVEST_FRESH": 50.0,
     "CARE": 45.0,
@@ -64,6 +65,22 @@ def harvest_urgency(tile: TileState, current_step: int) -> float:
 
 def generate_tasks(farm: FarmState) -> list[Task]:
     tasks: list[Task] = []
+
+    # If there's at least as much unclaimed empty land as there are units
+    # to work it, treat expansion (PLANT) as competitive with routine
+    # upkeep instead of always losing to it. Without this, a small
+    # established cluster of planted tiles generates recurring
+    # WATER/HARVEST obligations that permanently outrank PLANT (30 <
+    # WATER_ROUTINE's 55), so every unit gets absorbed into maintaining
+    # the same few tiles forever and expansion never happens. Confirmed
+    # in a real run: 4 units settled onto exactly 4 tiles and never grew
+    # past them -- 21 of 25 NW tiles sat untouched the whole episode.
+    # PLANT_ABUNDANT still loses to anything that risks an actual loss
+    # (FEED_CRITICAL/WATER_CRITICAL/HARVEST_DECAYING/PLACE) -- only
+    # routine upkeep yields to it.
+    n_units = 1 + len(farm.hands)
+    empty_count = sum(1 for t in farm.tiles if not t.locked and t.kind is None)
+    plant_urgency = BASE_URGENCY["PLANT_ABUNDANT"] if empty_count >= n_units else BASE_URGENCY["PLANT"]
 
     for tile in farm.tiles:
         if tile.locked:
@@ -102,7 +119,7 @@ def generate_tasks(farm: FarmState) -> list[Task]:
             continue
 
         # tile.kind is None -- empty, unlocked, plantable
-        tasks.append(Task("PLANT", tile, BASE_URGENCY["PLANT"]))
+        tasks.append(Task("PLANT", tile, plant_urgency))
 
     tasks.sort(key=lambda t: t.urgency, reverse=True)
     return tasks

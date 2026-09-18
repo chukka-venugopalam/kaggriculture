@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from mechanics import decay_urgency, hire_cost, is_decaying, per_turn_shop_demand
 from state import FarmState, TileState, UnitState, size_keeper_pool
-from strategy import generate_tasks, harvest_urgency, shop_aware_sell_plan
+from strategy import BASE_URGENCY, generate_tasks, harvest_urgency, shop_aware_sell_plan
 
 
 def test_hire_cost_is_fibonacci_and_resets_daily() -> None:
@@ -79,6 +79,50 @@ def test_generate_tasks_skips_locked_tiles() -> None:
         hands=[],
     )
     assert generate_tasks(farm) == []
+
+
+def _trap_farm(n_planted: int, n_empty: int, n_units: int, critical: bool = False) -> FarmState:
+    tiles = [
+        TileState(
+            x=i, y=0, kind="PLANT", crop="WHEAT", watered_today=False,
+            consecutive_unwatered=1 if critical else 0,
+        )
+        for i in range(n_planted)
+    ]
+    tiles += [TileState(x=i, y=1, kind=None) for i in range(n_empty)]
+    return FarmState(
+        step=100, day=4, hour=4, money=3000, shed={}, seeds={"WHEAT": 10},
+        market_prices={}, market_inventory={}, unlocked_shops=[], unlocked_quadrants=["NW"], hires_today=0,
+        tiles=tiles, farmer=UnitState(unit_id="farmer", x=0, y=0),
+        hands=[UnitState(unit_id=f"hand_{i}", x=0, y=0) for i in range(n_units - 1)],
+    )
+
+
+def test_plant_urgency_beats_routine_watering_when_land_is_abundant() -> None:
+    # Regression test for a real bug: 4 units settled onto exactly 4
+    # planted tiles and never expanded, because those tiles' recurring
+    # WATER_ROUTINE obligations (55) permanently outranked PLANT (30),
+    # even with 21 empty tiles sitting untouched. Confirmed in a real
+    # 700+ step run. With at least as much empty land as units, PLANT
+    # must now win over routine (non-critical) watering.
+    farm = _trap_farm(n_planted=4, n_empty=21, n_units=4, critical=False)
+    top = generate_tasks(farm)[:4]
+    assert all(t.kind == "PLANT" for t in top)
+
+
+def test_plant_urgency_still_loses_to_a_genuine_watering_crisis() -> None:
+    # The fix above must not come at the cost of actually losing a plant:
+    # one more missed watering turns it into a weed, so that must still
+    # outrank expansion regardless of how much empty land is available.
+    farm = _trap_farm(n_planted=4, n_empty=21, n_units=4, critical=True)
+    top = generate_tasks(farm)[:4]
+    assert all(t.kind == "WATER" for t in top)
+
+
+def test_plant_urgency_drops_back_once_land_is_no_longer_abundant() -> None:
+    farm = _trap_farm(n_planted=4, n_empty=2, n_units=4, critical=False)  # empty (2) < units (4)
+    plant_task = next(t for t in generate_tasks(farm) if t.kind == "PLANT")
+    assert plant_task.urgency == BASE_URGENCY["PLANT"]
 
 
 def test_shop_aware_sell_plan_sells_any_nonzero_shed_quantity() -> None:

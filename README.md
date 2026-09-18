@@ -63,28 +63,33 @@ python scripts/build_submission.py
   working alone.
 - Hiring, once capped correctly at 3/day, took the same run to 5855.0 --
   roughly 3x the net profit (934 -> 2855).
-- Land-buying and the nearest-tied-task fix are new this pass, verified
-  directly (7 scenarios covering every trigger condition) but not yet
-  run in a full episode.
+- A later real run (5738.0, land-buying + nearest-tied-task pass) exposed
+  a real expansion-trap bug via its tile map: 4 units settled onto
+  exactly 4 planted tiles and never grew past them, 21 of 25 NW tiles
+  sitting untouched the whole episode, because those 4 tiles' recurring
+  WATER_ROUTINE obligations permanently outranked PLANT in the urgency
+  scale. Fixed: PLANT now competes with (and beats) routine upkeep
+  whenever empty land >= unit count, confirmed directly against the
+  exact trap scenario -- and confirmed a genuine watering crisis (one
+  more miss = weed) still correctly overrides expansion regardless.
 
 `submission/main.py` re-verified identical to the modular source after
 every change above.
 
 ## What's still open
 
-- **Whether land-buying and the nearest-tied-task fix actually improve
-  the real result** -- both are directly simulated and unit-tested (7
-  hand-verified scenarios: nearest-tied-task selection, land purchase
-  triggering/not-triggering in every relevant case, the market-order cap
-  never being exceeded), but not yet run end-to-end for real.
+- **Whether the expansion-trap fix, combined with land-buying, actually
+  reaches a meaningfully higher result** -- directly verified against the
+  exact trap scenario (realistic steady-state AND genuine-crisis cases
+  both behave correctly), but not yet re-run for real.
 - **Task assignment is a greedy nearest-pair heuristic**, not a true
   optimal assignment -- fine for a handful of units against a few dozen
   tasks, not guaranteed optimal
 - **Ongoing-crop decay** (tomato/strawberry) isn't modeled --
   `max_lifespan_step` is always `-1` for these
 - **Crop selection** for empty tiles is a placeholder (always WHEAT)
-- `LAND_BUY_MIN_EMPTY_TILES = 3` and `LAND_BUY_MONEY_BUFFER = 500` are
-  starting guesses, not tuned
+- `LAND_BUY_MIN_EMPTY_TILES = 3`, `LAND_BUY_MONEY_BUFFER = 500`, and the
+  new `PLANT_ABUNDANT = 65` urgency value are starting guesses, not tuned
 
 ## Deliberately left open (tunable -- resolve via real self-play, not a guess)
 
