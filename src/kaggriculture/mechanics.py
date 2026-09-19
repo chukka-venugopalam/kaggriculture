@@ -10,6 +10,7 @@ claim is deliberately NOT included here.
 """
 
 from __future__ import annotations
+import math
 from dataclasses import dataclass
 from enum import Enum
 
@@ -142,6 +143,20 @@ SHED_CAPACITY: int = 100  # flat cap; seeds live in a separate, uncapped slot
 # Overflow at end-of-day drop is discarded, not held anywhere.
 
 # ---------------------------------------------------------------------------
+# Labor/land ratio — derived from the one confirmed-good data point: 4
+# units (farmer + 3 hands) maintaining a full 25-tile NW quadrant scored
+# 5855.0, the best confirmed real result so far. 25/4 = 6.25 tiles per
+# unit. Used two places: (1) capping how many tiles the PLANT_ABUNDANT
+# priority will push units to claim, so planting doesn't keep outrunning
+# the labor force once land is bought, and (2) scaling MAX_HIRES_PER_DAY
+# with unlocked land instead of a flat cap tuned only for 25 tiles. Both
+# exist to fix the confirmed over-expansion collapse (a real run bought
+# 2 extra quadrants, labor stayed flat at 4, and the entire original
+# NW quadrant decayed to weeds by step 700 -- reward fell from 5855.0 to
+# 3171.0). Not yet re-validated against a real episode.
+TILES_PER_UNIT: float = 6.25
+
+# ---------------------------------------------------------------------------
 # Hiring
 # ---------------------------------------------------------------------------
 
@@ -190,12 +205,80 @@ def per_turn_shop_demand(unlocked_shops: list[str]) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Market pricing — shape differs per resource. Exact amp/curve constants
-# weren't captured in the source report, so this is directional only:
-# melon/wool ("sq"): crash hard on gluts, sell early and steadily.
-# wheat ("log"): forgiving on gluts, safe to sell in bulk.
-# carrot/tomato/egg ("hinge"): stays near base until a scarcity knee, then
-#   rises fast — avoid dumping inventory that resets this knee.
+# Market pricing — CONFIRMED, not directional. Source: cross-checked against
+# three independent parties who each reverse-engineered the exact same
+# constants (two separate top-30 competitors' shipped agents, kaito_v4 and
+# ray_v11) AND an empirical measurement (price_curves.csv, shipped in a
+# public evaluation notebook's reference-agent dataset, which reports real
+# observed price_at_50_sold / price_at_150_sold / etc. that match this
+# formula's output exactly). This replaces the old "directional only" note.
+#
+# Shape per item: (base_price, equilibrium_inventory, scale, below_func,
+# below_target, above_func, above_target). Below/above describe the curve
+# on each side of equilibrium (scarcity vs. glut); func is one of
+# "linear"/"sq"/"sqrt"/"log"/"log10" and target is the curve's amplitude
+# coefficient. equilibrium is 10_000 for every item (matches
+# MARKET_STARTING_INVENTORY below) in every source that reported it.
 # ---------------------------------------------------------------------------
 
 MARKET_STARTING_INVENTORY: int = 10_000  # I0, every product
+PRICE_FLOOR: int = 1
+
+MarketCurve = tuple[int, int, int, str, float, str, float]
+
+MARKET_PARAMS: dict[str, MarketCurve] = {
+    "WHEAT": (25, MARKET_STARTING_INVENTORY, 400, "sqrt", 0.8, "log", 0.2),
+    "CARROT": (35, MARKET_STARTING_INVENTORY, 450, "log", 0.2, "sqrt", 0.7),
+    "TOMATO": (60, MARKET_STARTING_INVENTORY, 200, "linear", 0.4, "sqrt", 0.6),
+    "STRAWBERRY": (120, MARKET_STARTING_INVENTORY, 100, "sqrt", 0.7, "linear", 1.6),
+    "MELON": (250, MARKET_STARTING_INVENTORY, 300, "log", 0.2, "sq", 3.6),
+    "EGG": (50, MARKET_STARTING_INVENTORY, 332, "linear", 0.4, "log", 0.2),
+    "MILK": (160, MARKET_STARTING_INVENTORY, 122, "sqrt", 0.6, "linear", 1.6),
+    "WOOL": (200, MARKET_STARTING_INVENTORY, 105, "log", 0.2, "sq", 3.2),
+    "FERTILIZER": (100, MARKET_STARTING_INVENTORY, 200, "linear", 0.4, "linear", 0.4),
+}
+
+
+def _curve_shape(name: str, value: float) -> float:
+    value = max(0.0, value)
+    if name == "linear":
+        return value
+    if name == "sq":
+        return value * value
+    if name == "sqrt":
+        return value ** 0.5
+    if name == "log":
+        return math.log1p(value)
+    if name == "log10":
+        return math.log10(1.0 + value)
+    return value
+
+
+def market_price(item: str, inventory: int) -> int:
+    """Confirmed market price formula. `inventory` is the item's current
+    public market inventory (obs["market"]["inventory"][item]), not our
+    shed. Below equilibrium (scarce) price rises above base; above
+    equilibrium (glutted) price falls below base, floored at PRICE_FLOOR."""
+    params = MARKET_PARAMS.get(item)
+    if params is None:
+        return PRICE_FLOOR
+    base, equilibrium, scale, below_func, below_target, above_func, above_target = params
+    if inventory < equilibrium:
+        amp = below_target * base / _curve_shape(below_func, scale)
+        value = base + amp * _curve_shape(below_func, equilibrium - inventory)
+    else:
+        amp = above_target * base / _curve_shape(above_func, scale)
+        value = base - amp * _curve_shape(above_func, inventory - equilibrium)
+    return max(PRICE_FLOOR, round(value))
+
+
+def sell_impact(item: str, inventory: int, quantity: int) -> float:
+    """Total revenue lost to this sale's own price impact: the gap between
+    selling at the current quote and selling after this quantity has
+    already pushed the price down. Higher impact = a worse time/size to
+    sell this much of this item right now."""
+    if quantity <= 0:
+        return 0.0
+    current = market_price(item, inventory)
+    after = market_price(item, inventory + quantity)
+    return quantity * max(0.0, current - after)

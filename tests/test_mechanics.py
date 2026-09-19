@@ -12,9 +12,28 @@ this suite is no substitute for it, the same way this project's earlier
 
 from __future__ import annotations
 
-from mechanics import decay_urgency, hire_cost, is_decaying, per_turn_shop_demand
+from mechanics import (
+    CROPS,
+    MARKET_PARAMS,
+    MARKET_STARTING_INVENTORY,
+    PRICE_FLOOR,
+    TILES_PER_UNIT,
+    decay_urgency,
+    hire_cost,
+    is_decaying,
+    market_price,
+    per_turn_shop_demand,
+)
 from state import FarmState, TileState, UnitState, size_keeper_pool
-from strategy import BASE_URGENCY, generate_tasks, harvest_urgency, shop_aware_sell_plan
+from strategy import (
+    BASE_URGENCY,
+    best_plantable_crop,
+    critical_backlog_count,
+    crop_roi,
+    generate_tasks,
+    harvest_urgency,
+    market_aware_sell_plan,
+)
 
 
 def test_hire_cost_is_fibonacci_and_resets_daily() -> None:
@@ -125,7 +144,44 @@ def test_plant_urgency_drops_back_once_land_is_no_longer_abundant() -> None:
     assert plant_task.urgency == BASE_URGENCY["PLANT"]
 
 
-def test_shop_aware_sell_plan_sells_any_nonzero_shed_quantity() -> None:
+def test_plant_urgency_drops_back_once_labor_capacity_reached() -> None:
+    # Regression test for the confirmed over-expansion collapse: the
+    # original expansion-trap fix had no ceiling on PLANT_ABUNDANT, so it
+    # kept pushing units to claim more land forever as long as empty land
+    # was abundant -- even once already-planted tiles far exceeded what
+    # the labor force could actually maintain. A real run bought 2 extra
+    # quadrants this way while labor stayed flat, and the original
+    # quadrant decayed to weeds. With 1 unit, labor_capacity is
+    # TILES_PER_UNIT (6.25) -- 7 already-planted tiles is over that, so
+    # PLANT must drop back to its low base priority even with 10 empty
+    # tiles sitting right there (room_to_expand alone is no longer enough).
+    farm = _trap_farm(n_planted=7, n_empty=10, n_units=1, critical=False)
+    plant_task = next(t for t in generate_tasks(farm) if t.kind == "PLANT")
+    assert plant_task.urgency == BASE_URGENCY["PLANT"]
+
+
+def test_plant_urgency_abundant_when_under_labor_capacity() -> None:
+    # Sanity check on the same ceiling: with plenty of labor relative to
+    # what's planted (4 units, labor_capacity = 25), PLANT_ABUNDANT still
+    # applies -- this is the original confirmed-good 5855.0 scenario
+    # (4 units, 4 planted, 21 empty), unaffected by the new cap.
+    farm = _trap_farm(n_planted=4, n_empty=21, n_units=4, critical=False)
+    plant_task = next(t for t in generate_tasks(farm) if t.kind == "PLANT")
+    assert plant_task.urgency == BASE_URGENCY["PLANT_ABUNDANT"]
+
+
+def test_critical_backlog_count_counts_only_genuine_loss_tasks() -> None:
+    tasks = generate_tasks(_trap_farm(n_planted=4, n_empty=21, n_units=4, critical=True))
+    # All 4 planted tiles are one missed watering from becoming weeds.
+    assert critical_backlog_count(tasks) == 4
+
+
+def test_critical_backlog_count_zero_when_nothing_is_critical() -> None:
+    tasks = generate_tasks(_trap_farm(n_planted=4, n_empty=21, n_units=4, critical=False))
+    assert critical_backlog_count(tasks) == 0
+
+
+def test_market_aware_sell_plan_sells_any_nonzero_shed_quantity() -> None:
     # Regression test for a real bug: an earlier version only sold once
     # the shed was nearly full, which meant it silently never sold
     # anything for a small farm (a real 720-turn run showed money going
@@ -147,6 +203,74 @@ def test_shop_aware_sell_plan_sells_any_nonzero_shed_quantity() -> None:
         farmer=UnitState(unit_id="farmer", x=4, y=4),
         hands=[],
     )
-    plan = shop_aware_sell_plan(farm)
+    plan = market_aware_sell_plan(farm)
     assert ("WHEAT", 2) in plan
     assert all(item != "CARROT" for item, _ in plan)  # zero quantity isn't sellable
+
+
+def test_market_price_at_equilibrium_equals_base_price() -> None:
+    for item, params in MARKET_PARAMS.items():
+        assert market_price(item, params[1]) == params[0]
+
+
+def test_market_price_falls_below_base_when_glutted() -> None:
+    assert market_price("MELON", 10_500) < 250
+
+
+def test_market_price_rises_above_base_when_scarce() -> None:
+    assert market_price("MELON", 9_500) > 250
+
+
+def test_market_price_never_drops_below_floor() -> None:
+    assert market_price("WOOL", 50_000) == PRICE_FLOOR
+
+
+def test_crop_roi_prefers_high_value_crop_at_equal_market_state() -> None:
+    # At equilibrium (base price) for every crop, MELON (base 250) must
+    # rank above WHEAT (base 25) -- the whole point of live-ROI selection
+    # over a hardcoded single crop.
+    prices = {name: profile.base_price for name, profile in CROPS.items()}
+    inv = {name: MARKET_STARTING_INVENTORY for name in CROPS}
+    assert crop_roi("MELON", prices, inv) > crop_roi("WHEAT", prices, inv)
+
+
+def test_best_plantable_crop_falls_back_when_top_choice_unaffordable() -> None:
+    farm = FarmState(
+        step=0, day=0, hour=0, money=15,  # can't afford MELON (80) or most others
+        shed={}, seeds={}, market_prices={}, market_inventory={},
+        unlocked_shops=[], unlocked_quadrants=["NW"], hires_today=0,
+        tiles=[], farmer=UnitState(unit_id="farmer", x=4, y=4), hands=[],
+    )
+    choice = best_plantable_crop(farm)
+    assert choice is not None
+    assert CROPS[choice].seed_cost <= 15
+
+
+def test_glut_batch_cap_meters_steep_curve_items_below_full_shed() -> None:
+    # WOOL has a small anchor throughput (105) and a steep glut curve --
+    # a big batch must NOT be sold in one order while the shed has room.
+    farm = FarmState(
+        step=0, day=0, hour=0, money=3000,
+        shed={"WOOL": 70}, seeds={}, market_prices={},  # 70 < 80 shed-pressure threshold
+        market_inventory={"WOOL": MARKET_STARTING_INVENTORY},
+        unlocked_shops=[], unlocked_quadrants=["NW"], hires_today=0,
+        tiles=[], farmer=UnitState(unit_id="farmer", x=4, y=4), hands=[],
+    )
+    plan = market_aware_sell_plan(farm)
+    assert plan and plan[0][0] == "WOOL"
+    assert plan[0][1] < 70
+
+
+def test_market_aware_sell_plan_ignores_metering_under_shed_pressure() -> None:
+    # Same setup, but the shed is nearly full (>=80 total) -- metering
+    # must be dropped so the goods sell now instead of being discarded by
+    # the unheld end-of-day overflow rule.
+    farm = FarmState(
+        step=0, day=0, hour=0, money=3000,
+        shed={"WOOL": 90}, seeds={}, market_prices={},
+        market_inventory={"WOOL": MARKET_STARTING_INVENTORY},
+        unlocked_shops=[], unlocked_quadrants=["NW"], hires_today=0,
+        tiles=[], farmer=UnitState(unit_id="farmer", x=4, y=4), hands=[],
+    )
+    plan = market_aware_sell_plan(farm)
+    assert ("WOOL", 90) in plan

@@ -19,20 +19,12 @@ once the observation parsing itself was corrected.
 
 from __future__ import annotations
 import logging
+import math
 from typing import Any
 
-from mechanics import CROPS, MAX_MARKET_ORDERS_PER_TURN, QUADRANT_COSTS, QUADRANT_NAMES, hire_cost
+from mechanics import CROPS, MAX_MARKET_ORDERS_PER_TURN, QUADRANT_COSTS, QUADRANT_NAMES, TILES_PER_UNIT, hire_cost
 from state import FarmState, TileState, UnitState
-from strategy import generate_tasks, shop_aware_sell_plan
-
-logger = logging.getLogger("kaggriculture_agent")
-logging.basicConfig(level=logging.WARNING)
-
-# Placeholder crop-selection heuristic -- always WHEAT. CROPS in
-# mechanics.py has profiles for CARROT/TOMATO/STRAWBERRY/MELON too; a real
-# selection heuristic (season timing, market price, land-use mix) is the
-# next piece of strategy to build, not this pass.
-DEFAULT_PLANT_CROP = "WHEAT"
+from strategy import Task, best_plantable_crop, critical_backlog_count, generate_tasks, market_aware_sell_plan
 
 
 def parse_observation(obs: dict[str, Any], config: dict[str, Any]) -> FarmState:
@@ -111,11 +103,23 @@ HIRE_MONEY_BUFFER = 50
 # "backlog exceeds units" trigger alone never stops firing early on --
 # 25 empty tiles outnumbers even a dozen units -- so an early real run
 # hired every single turn and the escalating fibonacci cost crashed the
-# bank from 3000 to 40 in one day. Capped here instead: at most this many
-# hires per day, regardless of backlog. Confirmed working and profitable
-# in a real run at 3 (3934 -> 5855); still a starting guess, not tuned
-# further than that one data point.
-MAX_HIRES_PER_DAY = 3
+# bank from 3000 to 40 in one day.
+#
+# Originally capped at a flat MAX_HIRES_PER_DAY = 3, confirmed working
+# and profitable in a real run (3934 -> 5855). But that flat cap was
+# tuned only for the original 25-tile NW quadrant -- once land-buying was
+# added, a real run expanded to 75 tiles while labor stayed capped at 4
+# units, and the original quadrant decayed to weeds from neglect (5855 ->
+# 3171). Fixed here by scaling the cap with unlocked land instead of a
+# flat number, using the same TILES_PER_UNIT ratio (mechanics.py) that
+# produced the one confirmed-good data point. Still gated by
+# HIRE_MONEY_BUFFER below, so this raises the ceiling without forcing
+# spending the game can't afford. Not yet re-run against a real episode.
+def _max_hires_for_day(farm: FarmState) -> int:
+    unlocked_tiles = 25 * len(farm.unlocked_quadrants)
+    target_units = max(1, math.ceil(unlocked_tiles / TILES_PER_UNIT))
+    return max(1, target_units - 1)  # -1: the farmer isn't hired, already free
+
 
 # Land-buying: unlike hiring, each quadrant is a one-time purchase (no
 # fibonacci-style escalation risk -- QUADRANT_COSTS is fixed, and
@@ -126,10 +130,22 @@ MAX_HIRES_PER_DAY = 3
 LAND_BUY_MIN_EMPTY_TILES = 3
 LAND_BUY_MONEY_BUFFER = 500  # bigger buffer than hiring's -- land costs up to $4k
 
+# Confirmed root cause of the over-expansion collapse: land was bought
+# while the existing quadrant still had real maintenance debt, and the
+# expansion-trap fix (PLANT_ABUNDANT) then pulled units toward the new
+# land instead of clearing that debt, so the original quadrant decayed
+# to weeds. Gate land-buying on maintenance health first: don't spend on
+# more land while there's a genuine critical backlog (watering/feeding
+# emergencies, decaying harvests) on what's already owned.
+LAND_BUY_MAX_CRITICAL_BACKLOG = 0
 
-def _maybe_buy_land(farm: FarmState) -> list[Any] | None:
+
+def _maybe_buy_land(farm: FarmState, tasks: list[Task]) -> list[Any] | None:
     if len(farm.unlocked_quadrants) >= len(QUADRANT_NAMES):
         return None  # fully unlocked already
+
+    if critical_backlog_count(tasks) > LAND_BUY_MAX_CRITICAL_BACKLOG:
+        return None  # existing land isn't well cared for yet -- don't expand
 
     empty_tiles = sum(1 for t in farm.tiles if not t.locked and t.kind is None)
     if empty_tiles > LAND_BUY_MIN_EMPTY_TILES:
@@ -166,15 +182,32 @@ def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]
     remaining_task_idxs = list(range(len(tasks)))
     remaining_units = list(range(len(units)))
     market_orders: list[Any] = []
-    wheat_seeds_committed = 0
+    seeds_committed = 0
 
-    # Proactively keep at least one wheat seed in the pipeline whenever a
-    # PLANT task is pending -- buying only once a unit physically arrives
-    # at an empty tile would waste however many turns the walk took.
-    if any(t.kind == "PLANT" for t in tasks) and farm.seeds.get(DEFAULT_PLANT_CROP, 0) <= 0:
-        cost = CROPS[DEFAULT_PLANT_CROP].seed_cost
-        if farm.money >= cost:
-            market_orders.append(["BUY_SEED", DEFAULT_PLANT_CROP, 1])
+    # Re-picked every turn from the LIVE market (strategy.py::crop_roi), so
+    # as one crop's price gets glutted from repeated selling, planting
+    # naturally shifts to whichever crop is currently the best live ROI --
+    # no fixed rotation, no hardcoded single crop. Held fixed for the rest
+    # of this turn: every unit that plants this turn plants the same thing,
+    # so the seed-commitment count below stays a single running total
+    # instead of needing a per-crop dict.
+    plant_crop = best_plantable_crop(farm)
+
+    # Proactively keep seed in the pipeline whenever a PLANT task is
+    # pending -- buying only once a unit physically arrives at an empty
+    # tile would waste however many turns the walk took. Buy enough for
+    # every PLANT task queued this turn, not just one, so a batch of
+    # simultaneous plantings isn't seed-starved after the first.
+    pending_plants = sum(1 for t in tasks if t.kind == "PLANT")
+    if plant_crop is not None and pending_plants > 0:
+        held = farm.seeds.get(plant_crop, 0)
+        need = max(0, pending_plants - held)
+        if need > 0:
+            cost_each = CROPS[plant_crop].seed_cost
+            affordable = int(farm.money // cost_each) if cost_each > 0 else need
+            buy_qty = min(need, max(0, affordable))
+            if buy_qty > 0:
+                market_orders.append(["BUY_SEED", plant_crop, buy_qty])
 
     while remaining_task_idxs and remaining_units:
         top_urgency = tasks[remaining_task_idxs[0]].urgency
@@ -202,9 +235,9 @@ def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]
         # what's already been committed to other units this same turn.
         # Confirmed: if two units both PLANT the same turn with
         # insufficient seed for both, NEITHER plants.
-        if farm.seeds.get(DEFAULT_PLANT_CROP, 0) - wheat_seeds_committed > 0:
-            ops[ui] = ["PLANT", DEFAULT_PLANT_CROP]
-            wheat_seeds_committed += 1
+        if plant_crop is not None and farm.seeds.get(plant_crop, 0) - seeds_committed > 0:
+            ops[ui] = ["PLANT", plant_crop]
+            seeds_committed += 1
         else:
             ops[ui] = ["PASS"]  # seed queued above but hasn't landed yet
 
@@ -212,13 +245,14 @@ def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]
         ops[ui] = ["PASS"]  # more units than tasks this turn
 
     # More backlog than units to cover it, and we can afford another --
-    # hire one, up to the daily cap. The new hand shows up next turn.
-    if len(tasks) > len(units) and farm.hires_today < MAX_HIRES_PER_DAY:
+    # hire one, up to the daily cap (scaled to unlocked land -- see
+    # _max_hires_for_day). The new hand shows up next turn.
+    if len(tasks) > len(units) and farm.hires_today < _max_hires_for_day(farm):
         cost = hire_cost(farm.hires_today)
         if farm.money >= cost + HIRE_MONEY_BUFFER:
             market_orders.append(["HIRE"])
 
-    land_order = _maybe_buy_land(farm)
+    land_order = _maybe_buy_land(farm, tasks)
     if land_order:
         market_orders.append(land_order)
 
@@ -227,7 +261,7 @@ def _decide_ops(farm: FarmState) -> tuple[list[Any], list[list[Any]], list[Any]]
     # MAX_MARKET_ORDERS_PER_TURN are silently dropped by the engine, so
     # sizing this dynamically means a sell never crowds out a buy/hire).
     remaining_slots = max(0, MAX_MARKET_ORDERS_PER_TURN - len(market_orders))
-    for item, qty in shop_aware_sell_plan(farm, max_orders=remaining_slots):
+    for item, qty in market_aware_sell_plan(farm, max_orders=remaining_slots):
         market_orders.append(["SELL", item, qty])
 
     farmer_op = ops.get(0, ["PASS"])

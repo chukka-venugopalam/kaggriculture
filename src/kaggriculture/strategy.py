@@ -20,9 +20,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mechanics import (
+    CROPS,
+    MARKET_PARAMS,
+    MARKET_STARTING_INVENTORY,
     MAX_CONSECUTIVE_UNFED,
     MAX_CONSECUTIVE_UNWATERED,
+    PRICE_FLOOR,
+    TILES_PER_UNIT,
     decay_urgency,
+    market_price,
+    sell_impact,
 )
 from state import FarmState, TileState
 
@@ -50,6 +57,21 @@ BASE_URGENCY: dict[str, float] = {
     "FERTILIZE": 20.0,
     "COLLECT_FERTILIZER": 10.0,
 }
+
+
+# Any task at or above this urgency represents a genuine, unrecoverable
+# loss if ignored this turn (FEED_CRITICAL/WATER_CRITICAL/HARVEST_DECAYING
+# all sit here or above; PLACE also clears it but isn't loss-driven).
+# Used to gate land-buying: expanding while this backlog is nonzero is
+# exactly the pattern behind the confirmed over-expansion collapse (labor
+# stayed flat while land tripled, and the original quadrant decayed to
+# weeds while units were pulled toward newly-bought land).
+CRITICAL_URGENCY_THRESHOLD: float = BASE_URGENCY["HARVEST_DECAYING"]
+
+
+def critical_backlog_count(tasks: list[Task]) -> int:
+    """How many pending tasks are at genuine-loss urgency right now."""
+    return sum(1 for t in tasks if t.urgency >= CRITICAL_URGENCY_THRESHOLD)
 
 
 def harvest_urgency(tile: TileState, current_step: int) -> float:
@@ -80,7 +102,26 @@ def generate_tasks(farm: FarmState) -> list[Task]:
     # routine upkeep yields to it.
     n_units = 1 + len(farm.hands)
     empty_count = sum(1 for t in farm.tiles if not t.locked and t.kind is None)
-    plant_urgency = BASE_URGENCY["PLANT_ABUNDANT"] if empty_count >= n_units else BASE_URGENCY["PLANT"]
+
+    # CRITICAL, confirmed-fixed here: fix #4 above (PLANT_ABUNDANT) had no
+    # ceiling -- as long as empty_count >= n_units, it kept pushing units
+    # to claim more land forever, regardless of how much was already
+    # planted. Combined with land-buying, this is exactly what produced
+    # the real over-expansion collapse: land tripled, labor stayed flat,
+    # and the original quadrant decayed to weeds while units kept
+    # chasing new empty tiles. Ceiling: once already-planted tiles reach
+    # what this labor force can sustainably maintain (TILES_PER_UNIT,
+    # mechanics.py -- derived from the one confirmed-good 25-tile/4-unit
+    # data point), PLANT drops back to its low base priority so units
+    # focus on upkeep of what's already planted instead of continuing to
+    # expand past their own maintenance capacity.
+    planted_count = sum(1 for t in farm.tiles if not t.locked and t.kind == "PLANT")
+    labor_capacity = n_units * TILES_PER_UNIT
+    room_to_expand = empty_count >= n_units
+    under_labor_cap = planted_count < labor_capacity
+    plant_urgency = (
+        BASE_URGENCY["PLANT_ABUNDANT"] if (room_to_expand and under_labor_cap) else BASE_URGENCY["PLANT"]
+    )
 
     for tile in farm.tiles:
         if tile.locked:
@@ -125,23 +166,90 @@ def generate_tasks(farm: FarmState) -> list[Task]:
     return tasks
 
 
-def shop_aware_sell_plan(farm: FarmState, max_orders: int = 8) -> list[tuple[str, int]]:
-    """
-    Sell whatever's in the shed. Unsold inventory earns nothing (the
-    confirmed reward rule: "unsold items in inventory do not count"), so
-    there's no reason to hold produce back at this scale.
+def crop_roi(crop_name: str, market_prices: dict[str, float], market_inventory: dict[str, int]) -> float:
+    """Expected revenue per day of tile occupancy for a fresh planting,
+    priced off the LIVE market (current inventory, via the confirmed
+    market_price formula) rather than the crop's static base_price. This
+    is what makes crop selection self-diversifying: as one crop's market
+    gets glutted its price -- and therefore its ROI here -- drops, so the
+    next planting decision naturally shifts to whatever's still scarce,
+    with no explicit rotation rule needed.
 
-    This replaces an earlier version that only sold once the shed was
-    nearly full -- a reasonable-sounding "don't let it overflow"
-    heuristic that was actually the reason a real test run showed money
-    going steadily DOWN over 720 turns: with one or two crop tiles, the
-    shed never gets anywhere near full, so that version silently never
-    sold anything while still spending on seeds. Matches the pattern in
-    AGENTS.md's own reference agent instead (sell unconditionally, no
-    threshold). mechanics.py::per_turn_shop_demand is still there for a
-    later pass that times sales around passive town demand -- not used
-    to gate selling for now.
+    Conservative for TOMATO/STRAWBERRY: CropProfile doesn't carry a
+    confirmed per-cycle yield for their ongoing production, so this only
+    prices the guaranteed first harvest (max_yield). Their true ROI is
+    higher than this; ranking is still valid, just biased low for them.
     """
-    plan: list[tuple[str, int]] = [(item, qty) for item, qty in farm.shed.items() if qty > 0]
-    plan.sort(key=lambda p: p[1], reverse=True)
-    return plan[:max_orders]
+    profile = CROPS[crop_name]
+    inventory = market_inventory.get(crop_name)
+    price = market_price(crop_name, inventory) if inventory is not None else market_prices.get(
+        crop_name, profile.base_price
+    )
+    revenue = profile.max_yield * price - profile.seed_cost
+    days = max(1, profile.max_yield_day)
+    return revenue / days
+
+
+def best_plantable_crop(farm: FarmState) -> str | None:
+    """Highest live-ROI crop the farm can currently afford to seed (either
+    already holding seed, or able to buy at least one)."""
+    affordable = [
+        name for name, profile in CROPS.items()
+        if farm.seeds.get(name, 0) > 0 or farm.money >= profile.seed_cost
+    ]
+    if not affordable:
+        return None
+    return max(affordable, key=lambda name: crop_roi(name, farm.market_prices, farm.market_inventory))
+
+
+# Half of each item's confirmed "anchor throughput" (MARKET_PARAMS' scale
+# constant -- the game's own characteristic-volume figure for that item's
+# curve) as a per-order batch cap. Meters glut-prone items (MELON/WOOL:
+# small scale, steep "sq" above-equilibrium curve) into smaller sells
+# across turns instead of dumping the whole shed and crashing the price
+# against ourselves in one order; mild items (WHEAT: large scale, "log"
+# curve) get a cap high enough it never actually binds.
+def _glut_batch_cap(item: str) -> int:
+    params = MARKET_PARAMS.get(item)
+    if params is None:
+        return 100
+    scale = params[2]
+    return max(10, round(scale * 0.5))
+
+
+def market_aware_sell_plan(farm: FarmState, max_orders: int = 8) -> list[tuple[str, int]]:
+    """
+    Rank shed contents by net value (gross revenue minus this sale's own
+    price impact) instead of raw quantity, using the confirmed market
+    formula (mechanics.py::market_price/sell_impact). Two corrections on
+    top of a pure greedy-by-value rank:
+
+    - Glut-prone items are capped per order at _glut_batch_cap() rather
+      than sold in full, so a big harvest doesn't crash its own price in
+      one shot; the remainder waits for a later, less-impactful turn.
+    - Once the shed is nearly full (SHED_CAPACITY=100, and overflow is
+      discarded at end-of-day, not held), that metering is dropped and
+      everything sells now -- losing money to impact beats losing the
+      goods to overflow for free.
+    - An item already sitting at PRICE_FLOOR is skipped (not worth
+      selling into a crashed market) unless shed pressure forces it out
+      anyway.
+    """
+    shed_total = sum(max(0, int(q or 0)) for q in farm.shed.values())
+    pressure = shed_total >= 80
+
+    rows: list[tuple[float, str, int]] = []
+    for item, qty in farm.shed.items():
+        qty = max(0, int(qty or 0))
+        if qty <= 0:
+            continue
+        inventory = farm.market_inventory.get(item, MARKET_STARTING_INVENTORY)
+        price = market_price(item, inventory)
+        if price <= PRICE_FLOOR and not pressure:
+            continue
+        sell_qty = qty if pressure else min(qty, _glut_batch_cap(item))
+        net_value = sell_qty * price - sell_impact(item, inventory, sell_qty)
+        rows.append((net_value, item, sell_qty))
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [(item, qty) for _, item, qty in rows[:max_orders]]
